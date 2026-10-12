@@ -53,14 +53,14 @@ export class UserRef {
   @Prop({ type: String, required: true })
   id!: string;
 }
-const UserRefSchema = SchemaFactory.createForClass(UserRef);
+export const UserRefSchema = SchemaFactory.createForClass(UserRef);
 
 @Schema({ _id: false })
 export class SessionRef {
   @Prop({ type: String, required: true })
   id!: string;
 }
-const SessionRefSchema = SchemaFactory.createForClass(SessionRef);
+export const SessionRefSchema = SchemaFactory.createForClass(SessionRef);
 
 /**
  * error_events —— 异常事件明细
@@ -77,8 +77,8 @@ export class ErrorEvent {
   @Prop({ type: String, required: true, unique: true })
   event_id!: string;
 
-  /** 采集通道：onerror / unhandledrejection */
-  @Prop({ type: String, required: true, enum: ['onerror', 'unhandledrejection'] })
+  /** 采集通道：onerror / unhandledrejection / resource */
+  @Prop({ type: String, required: true, enum: ['onerror', 'unhandledrejection', 'resource'] })
   mechanism!: string;
 
   @Prop({ type: String, required: true })
@@ -139,14 +139,13 @@ export class ErrorEvent {
 export const ErrorEventSchema = SchemaFactory.createForClass(ErrorEvent);
 
 // 空字符串会污染查询结果，写入前归一成 undefined
-ErrorEventSchema.pre('validate', function (next) {
+ErrorEventSchema.pre('validate', async function () {
   for (const key of ['source', 'release', 'environment'] as const) {
     if (this.get(key) === '') this.set(key, undefined);
   }
-  next();
 });
 
-ErrorEventSchema.index({ event_id: 1 }, { unique: true });
+// event_id 的唯一索引由 @Prop({ unique: true }) 声明，此处不可重复声明
 ErrorEventSchema.index({ timestamp: -1 });
 // 30 天保留（SRS FR-4.11）。TTL 由后台任务清理，不精确，误差约 0~60 秒
 ErrorEventSchema.index({ timestamp: 1 }, { expireAfterSeconds: 2592000 });

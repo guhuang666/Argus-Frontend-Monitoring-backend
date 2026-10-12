@@ -4,6 +4,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ErrorEventsModule } from './error-events/error-events.module';
+import { PerformanceModule } from './performance/performance.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { ErrorEventsModule } from './error-events/error-events.module';
       }),
     }),
     ErrorEventsModule,
+    PerformanceModule,
   ],
   controllers: [AppController],
   providers: [AppService],
