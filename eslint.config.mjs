@@ -6,7 +6,9 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['eslint.config.mjs'],
+    // generated/ 是 Prisma 生成物（体积大、内容由机器产出）；prisma.config.ts 是 CLI 配置，
+    // 二者都不该被 lint 规则约束
+    ignores: ['eslint.config.mjs', 'generated/**', 'prisma.config.ts'],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,

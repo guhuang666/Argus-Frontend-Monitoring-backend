@@ -54,3 +54,9 @@ pids
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Prisma 自动生成的客户端（含 21MB 查询引擎二进制）
+# 由 `npx prisma generate` 产出，克隆仓库后重新生成即可，不入库
+# 若把 schema.prisma 里的 output 挪到别处，记得同步改这里
+/src/generated/
+/generated/

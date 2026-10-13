@@ -1,0 +1,41 @@
+# Argus 本地开发环境：PostgreSQL + Redis
+#
+# 在项目根目录执行：
+#   docker compose up -d            拉起两个服务（已存在则复用，数据不动）
+#   docker compose ps               看状态
+#   docker compose logs -f postgres 看日志
+#   docker compose down             收工 —— 不要加 -v，加了会连数据卷一起删
+#
+# 数据存放：PostgreSQL 的数据在具名卷 argus-pg-data 里，容器删了它还在，
+# 只有 docker compose down -v / docker volume rm 才会真正删除。
+
+# 项目名显式钉死为 argus。
+# 历史原因：本目录原名是中文（终极项目），Compose 取目录名做项目名时会被规整成
+# 空串，报 "project name must not be empty"，所有 docker compose 命令都会失败。
+# 目录现已改名为 Argus，默认推导结果本就是 argus，这一行保留是为了让项目名
+# （以及由此派生的网络名、容器名 argus-postgres-1）不随目录改名而漂移。
+name: argus
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: argus
+      POSTGRES_USER: argus
+      # 本地开发口令，仅监听本机端口；不要复用到其他环境
+      POSTGRES_PASSWORD: argus
+    ports: ["5432:5432"]
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7-alpine
+    # 未挂卷：重启后队列里的数据会丢（开发期可接受）。
+    # 若要做到重启不丢任务，再加具名卷并开启 AOF 持久化。
+    ports: ["6379:6379"]
+
+volumes:
+  pg-data:
+    # 把真实卷名钉死。不写这一行的话，卷名会是「项目名_pg-data」（即 argus_pg-data），
+    # 一旦改了项目目录名 / 项目名，Docker 就会建一个全新的空卷 —— 看起来像数据丢了。
+    # 注意：卷名一直是 argus-pg-data，目录从「终极项目」改成 Argus 不影响已有数据。
+    name: argus-pg-data

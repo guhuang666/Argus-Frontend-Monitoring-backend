@@ -1,22 +1,18 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
-import { MongooseModule } from '@nestjs/mongoose';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ErrorEventsModule } from './error-events/error-events.module';
 import { PerformanceModule } from './performance/performance.module';
+import { PrismaModule } from './prisma/prisma.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
-    MongooseModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        uri: config.getOrThrow<string>('MONGODB_URI'),
-        // 连接池按需，默认 100 够用
-        maxPoolSize: 10,
-      }),
-    }),
+    // PostgreSQL 数据访问层。
+    // 注：Mongoose 暂时保留 —— error-events / performance 两个模块还在用它，
+    // 等 Prisma 侧跑通、业务代码迁完再整体摘除，避免一次改两件事。
+    PrismaModule,
     ErrorEventsModule,
     PerformanceModule,
   ],

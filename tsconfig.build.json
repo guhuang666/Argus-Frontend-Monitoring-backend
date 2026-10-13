@@ -1,4 +1,9 @@
 {
   "extends": "./tsconfig.json",
+  // include 限定在 src：否则 prisma.config.ts（项目根下的 CLI 配置）会被一并编译进 dist。
+  // 注意不要在这显式写 rootDir：generated/prisma 被 src/prisma/prisma.service.ts import 进来，
+  // 但它位于 src 之外；显式 rootDir 会触发 TS6059，而让 TS 自行推断则产物落在
+  // dist/main.js + dist/generated/**，恰好是「入口在顶层、引擎相对路径仍指向 backend/generated」的正确形态。
+  "include": ["src/**/*"],
   "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
 }
