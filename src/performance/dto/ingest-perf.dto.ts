@@ -14,7 +14,7 @@ import {
 } from 'class-validator';
 
 /**
- * SDK 上报的性能指标体（POST /api/performance）。
+ * SDK 上报的性能指标体（POST /api/v1/performance）。
  *
  * 和错误接口一样，每个字段都要有上界：这个接口对公网开放，
  * 不限长度的话一条超长 url 就能把存储吃掉。

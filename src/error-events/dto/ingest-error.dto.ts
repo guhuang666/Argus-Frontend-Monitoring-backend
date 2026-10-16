@@ -11,7 +11,7 @@ import {
 } from 'class-validator';
 
 /**
- * SDK 上报的异常事件体（POST /api/store）。
+ * SDK 上报的异常事件体（POST /api/v1/error）。
  *
  * 每个字段的上限都不是随手写的：这个接口对公网开放，请求体大小和字符串长度
  * 都必须有界，否则一条超长 stack 就能把内存和存储吃掉。

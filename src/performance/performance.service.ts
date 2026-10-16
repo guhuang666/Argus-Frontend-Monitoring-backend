@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
-import { Prisma } from '../../generated/prisma/client';
+import { Prisma, type PerformanceMetric } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { IngestPerfDto } from './dto/ingest-perf.dto';
 
@@ -112,6 +112,87 @@ export class PerformanceService {
       deviceViewport: device?.viewport ?? null,
       deviceDpr: device?.dpr ?? null,
       connection: payload.connection ?? null,
+    };
+  }
+
+  /**
+   * 分页查询性能指标，按事件时间倒序。
+   *
+   * 响应形状（字段统一 snake_case）：
+   * {
+   *   items: [{
+   *     event_id, timestamp, received_at, url, user_agent,
+   *     sdk_name, sdk_version,
+   *     lcp, cls, inp,
+   *     lcp_element, inp_target, inp_element, inp_phase,
+   *     navigation_type, device_viewport, device_dpr, connection,
+   *     user_id, session_id, release, environment,
+   *   }],
+   *   total, page, pageSize,
+   * }
+   *
+   * 两个刻意的选择：
+   *   ① orderBy 用 timestamp —— 表上有 @@index([timestamp(sort: Desc)])
+   *      与 @@index([url, timestamp(sort: Desc)])，换字段就要全表 sort
+   *   ② 列表与总数放进同一个 $transaction —— 同一事务快照，两者不会对不上
+   *
+   * 注意 lcp / cls / inp 为 null 表示**这一项没测到**（不是 0）：
+   * 读取侧（看板分位数）必须跳过 null 而不是当 0 参与计算，否则"没数据"
+   * 会被算成"性能完美"。
+   *
+   * 过渡接口：暂无 projectId 过滤（表里还没有 project_id 列）。
+   */
+  async listPerformanceMetrics(page: number, pageSize: number) {
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.performanceMetric.findMany({
+        orderBy: { timestamp: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.performanceMetric.count(),
+    ]);
+
+    return {
+      items: rows.map((row) => this.toApiRow(row)),
+      total,
+      page,
+      pageSize,
+    };
+  }
+
+  /**
+   * 数据库行 → 接口响应。
+   *
+   * 为什么不直接 return rows：Prisma 返回的是内部模型形状，以后给表加了仅供
+   * 内部使用的列，它会自动出现在响应里。字段在这里显式列出 = 接口契约由这里定。
+   *
+   * Date 经 JSON.stringify 自动序列化成 ISO 8601 UTC 字符串（符合 SRS §8）；
+   * 本表没有 BigInt 列，不会踩 JSON.stringify 不支持 BigInt 的坑。
+   */
+  private toApiRow(row: PerformanceMetric) {
+    return {
+      event_id: row.eventId,
+      timestamp: row.timestamp,
+      received_at: row.receivedAt,
+      url: row.url,
+      user_agent: row.userAgent,
+      sdk_name: row.sdkName,
+      sdk_version: row.sdkVersion,
+      lcp: row.lcp,
+      cls: row.cls,
+      inp: row.inp,
+      lcp_element: row.lcpElement,
+      inp_target: row.inpTarget,
+      inp_element: row.inpElement,
+      inp_phase: row.inpPhase,
+      navigation_type: row.navigationType,
+      device_viewport: row.deviceViewport,
+      device_dpr: row.deviceDpr,
+      connection: row.connection,
+      user_id: row.userId,
+      session_id: row.sessionId,
+      release: row.release,
+      environment: row.environment,
     };
   }
 }

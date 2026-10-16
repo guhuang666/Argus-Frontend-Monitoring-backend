@@ -59,6 +59,72 @@ enum Mechanism {
   @@map("error_mechanism")
 }
 
+/// 问题 —— 归并后的实体，按 SRS §7.1 建，M2 的产物
+///
+/// 唯一约束把 grouping_version 也算进去，这是 v1.1 的关键决策：
+/// 同一个错误在 v1-raw（未符号化）与 v2-symbolicated（已还原源码）两套指纹下
+/// 可以同时存在、互不覆盖 —— M3 做受控重算时，历史 times_seen 才不会断档
+/// （FR-4.12 / FR-4.13）。
+///
+/// ⚠ MVP 阶段去掉了 project_id（单项目模式）—— 唯一约束从
+/// (project_id, grouping_version, fingerprint) 收窄为
+/// (grouping_version, fingerprint)，作用域由"项目内"变成"全局"。
+///
+/// 加回多项目时注意：project_id **必须 NOT NULL**。Postgres 的唯一索引把 NULL
+/// 视为互不相同，一旦 project_id 可空，三元组约束就形同虚设 —— 同一指纹能插进
+/// 任意多行 NULL，upsert 永远走 create，一个 bug 炸 1000 次就是 1000 行问题，
+/// 而且一句错都不报。
+model ErrorGroup {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 指纹哈希
+  fingerprint String @db.VarChar(64)
+
+  /// 指纹算法及其输入的版本：v1-raw / v2-symbolicated，见 FR-4.12
+  groupingVersion String @map("grouping_version") @db.VarChar(20)
+
+  /// 归一化后的标题
+  title String @db.VarChar(500)
+
+  /// 疑似责任位置，如 checkout.9f2c.js:renderSummary。
+  /// 可空：调用栈为空时（resource 通道、被裁剪过的 stack）算不出责任位置
+  culprit String? @db.VarChar(500)
+
+  /// fatal / error / warning / info —— 按 SRS 用 varchar 而非 enum：
+  /// 取值集合是产品语义，不是数据完整性约束，用 enum 每次加值都要迁移
+  level String @default("error") @db.VarChar(20)
+
+  /// unresolved / resolved / ignored / archived
+  status String @default("unresolved") @db.VarChar(20)
+
+  /// 累计发生次数 / 累计影响用户数。NOT NULL 列必须有初值，给 0
+  timesSeen BigInt @default(0) @map("times_seen")
+  usersSeen BigInt @default(0) @map("users_seen")
+
+  firstSeen DateTime @map("first_seen") @db.Timestamptz
+  lastSeen  DateTime @map("last_seen") @db.Timestamptz
+
+  /// 首次 / 最近出现的版本。可空：M1 的 SDK 还不上报 release，
+  /// 硬塞空串会让"没带版本"和"版本是空"混在一起
+  firstRelease String? @map("first_release") @db.VarChar(100)
+  lastRelease  String? @map("last_release") @db.VarChar(100)
+
+  /// 解决时间，NULL 表示尚未解决（对齐 project_keys.revoked_at 的写法）
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz
+
+  /// 反向关系：归并到本问题下的事件明细
+  events ErrorEvent[]
+
+  @@unique([groupingVersion, fingerprint])
+  /// MVP 去掉了 project_id，索引不再以它打头。
+  /// 加回多项目时把 project_id 放回最左 —— TC-08 要求每次查询都带 projectId，
+  /// 索引不以它打头就用不上（SRS §7.1 就是这么定的）。
+  @@index([lastSeen(sort: Desc)])
+  @@index([status, lastSeen(sort: Desc)])
+  @@index([groupingVersion, lastSeen(sort: Desc)])
+  @@map("error_groups")
+}
+
 /// 异常事件明细 —— 字段与删掉的 Mongoose error_events schema 一一对应
 ///
 /// 保留 Mongoose 时代的形状：写入侧不加工，归一化与指纹都在读取侧做（TC-10）。
@@ -115,6 +181,21 @@ model ErrorEvent {
   extra Json?
   /// 面包屑原样落库，读取侧（看板时间线 FR-8.6）再渲染
   breadcrumbs Json?
+
+  /* —— 归并相关（W1 新增，M2 使用）—— */
+
+  /// 指向归并后的问题。NULL = 尚未归并（M1 阶段全部为 NULL）。
+  ///
+  /// onDelete: SetNull 而不是 Cascade —— 删掉一个问题不该连带删掉事件明细：
+  /// 明细是"到底发生了什么"的唯一真相，问题只是它的一种聚合视图。
+  groupId String?     @map("group_id") @db.Uuid
+  group   ErrorGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+
+  /// Worker 幂等闸门：NULL = 尚未处理。
+  /// Worker 取到一批事件后先原子置位本列（UPDATE ... WHERE processed_at IS NULL），
+  /// 抢到的那次才去做归并 —— 保证同一条事件被重复消费时不会被归并两次。
+  /// 注意：这是**内部字段**，不是给用户看的"已读"标记，不要拿它过滤读接口。
+  processedAt DateTime? @map("processed_at") @db.Timestamptz
 
   /// 看板查询：某时间段内的事件列表
   @@index([timestamp(sort: Desc)])

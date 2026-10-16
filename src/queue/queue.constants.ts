@@ -1,0 +1,104 @@
+import type { JobsOptions } from 'bullmq';
+
+/**
+ * 队列契约（W3）—— 生产者（ingest）与消费者（worker）共用这一份常量。
+ *
+ * 单独成文件是为了避免"生产者 import 消费者的模块"这种反向依赖：
+ * 两边都只依赖契约，谁也不知道谁的存在。
+ */
+
+/** 归并工作队列：ingest 入队，Worker 消费 */
+export const ERROR_EVENT_QUEUE = 'error-events';
+
+/**
+ * 死信队列（DLQ）：重试耗尽后转入。
+ *
+ * **注意它现在没有消费者** —— 只是把失败现场留一份，等重驱动任务（W8 或后续里程碑）
+ * 来捞。另注：docker-compose 里的 redis 没有挂卷，重启即丢，所以这份 DLQ 是"开发期
+ * 够用"而不是"审计级可靠"。要做到重启不丢，得换成 PG 表（见 W3 交接说明）。
+ */
+export const ERROR_EVENT_DLQ = 'error-events-dlq';
+
+/** job 名。队列名回答"哪个队列"，job 名回答"干什么"：一个队列以后可能装多种 job */
+export const ERROR_EVENT_JOB = 'error-event';
+
+/**
+ * 工作 job 的载荷：**只带主键**。
+ *
+ * 明细（type / message / stack）从 PG 现读，不在 Redis 里存第二份 —— 否则事件在
+ * 入库后被修正、或者 schema 演进时，队列里那份就成了过期真相。载荷小还有个副作用
+ * 是好事：job 越小，Redis 内存和网络开销越低。
+ */
+export interface ErrorEventJobData {
+  eventId: string;
+}
+
+/** 死信载荷：原载荷 + 失败现场，够事后定位就行 */
+export interface ErrorEventDlqData extends ErrorEventJobData {
+  /** 最后一次失败的原因（Error.message） */
+  failedReason: string;
+  /** 一共尝试了几次（等于 attempts，因为只有重试耗尽才会进 DLQ） */
+  attemptsMade: number;
+  /** 转入 DLQ 的时间（ISO 字符串；Redis 里不存 Date） */
+  failedAt: string;
+}
+
+/**
+ * 工作 job 的默认选项。
+ *
+ * attempts: 3 —— 是**总次数**不是重试次数：首次 + 2 次重试。
+ *   backoff exponential delay 1000 → 第 2 次隔 1s，第 3 次隔 2s。
+ *
+ * removeOnComplete 留 1 小时 / 最多 5000 条：保留窗口 = jobId 去重的有效窗口。
+ *   队列里的 job 一旦被删，同 jobId 就能再次入队 —— 留一小时是为了让"SDK 重复上报
+ *   同一事件"落在窗口内被静默忽略，同时不让 Redis 无限长。
+ *
+ * removeOnFail: true —— 失败 job 立刻删掉，原因有两条：
+ *   ① 失败现场已经由 DLQ 存了一份，这份留着是重复的；
+ *   ② 更要紧的是**别把补扫堵死**：失败 job 如果留在 failed 集合里，W8 的补扫按
+ *      event_id 重新入队时会被 jobId 去重静默吃掉，那条事件就永远处理不了了。
+ *      删掉它，补扫才有机会重来。
+ *
+ * 注：真正的幂等闸门不是 jobId 而是 error_events.processed_at（见 processor），
+ * jobId 只是省掉重复劳动的第一道闸。
+ */
+export const ERROR_EVENT_JOB_OPTIONS: JobsOptions = {
+  attempts: 3,
+  backoff: { type: 'exponential', delay: 1000 },
+  removeOnComplete: { age: 3600, count: 5000 },
+  removeOnFail: true,
+};
+
+/**
+ * DLQ job 选项：不重试、不自动清理。
+ *
+ * 不清理是刻意的 —— DLQ 的价值就在于"东西还在那儿"，清理策略要等重驱动任务
+ * 落地时一起定（保住多久、重驱动几次后归档）。
+ */
+export const DLQ_JOB_OPTIONS: JobsOptions = {
+  removeOnComplete: false,
+  removeOnFail: false,
+};
+
+/**
+ * event_id → BullMQ 的 jobId。
+ *
+ * 直接用 event_id 是最理想的（排查时 jobId 就是事件主键），但 BullMQ 6 对自定义
+ * jobId 有两条硬校验（`bullmq/dist/cjs/classes/job.js:904-914`），踩中会**抛异常**、
+ * 直接把入队打回来：
+ *   · 纯整数形式的字符串 → `Custom Id cannot be integers`（如 event_id = "12345"）
+ *   · 含 `:` 且不是正好 3 段   → `Custom Id cannot contain :`
+ *
+ * SDK 生成的 id 是 UUID 或十六进制串，两条都不沾；但 `POST /api/v1/error` 是对公网
+ * 开放的，DTO 只校验"1~128 个字符"，第三方客户端发什么形状都收得下。所以这里做一次
+ * 映射，把非法形状挡在入队之前：
+ *   · `%` 先编码成 `%25`，再把 `:` 编码成 `%3A` —— 映射是单射（`a:b` 与 `a_b` 不会
+ *     互相顶掉），且不再含冒号
+ *   · 纯数字前面加 `e-`（带字母后 parseInt 得 NaN，整数校验必过）
+ *
+ * 常规 id（UUID）原样返回，jobId 依然等于 event_id。
+ */
+export function toJobId(eventId: string): string {
+  const encoded = eventId.replace(/%/g, '%25').replace(/:/g, '%3A');
+  return /^\d+$/.test(encoded) ? `e-${encoded}` : encoded;
+}

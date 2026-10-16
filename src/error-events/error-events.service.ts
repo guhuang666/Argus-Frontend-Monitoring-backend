@@ -1,6 +1,15 @@
+import { InjectQueue } from '@nestjs/bullmq';
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
-import { Prisma } from '../../generated/prisma/client';
+import type { Queue } from 'bullmq';
+import { Prisma, type ErrorEvent } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  ERROR_EVENT_JOB,
+  ERROR_EVENT_JOB_OPTIONS,
+  ERROR_EVENT_QUEUE,
+  toJobId,
+  type ErrorEventJobData,
+} from '../queue/queue.constants';
 import { IngestErrorDto } from './dto/ingest-error.dto';
 
 export interface IngestResult {
@@ -13,7 +22,10 @@ export interface IngestResult {
 export class ErrorEventsService {
   private readonly logger = new Logger(ErrorEventsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @InjectQueue(ERROR_EVENT_QUEUE) private readonly queue: Queue<ErrorEventJobData>,
+  ) {}
 
   /**
    * 把收到的异常事件**原样**打到控制台。
@@ -51,13 +63,18 @@ export class ErrorEventsService {
    *   updatedExisting 判断「这条是插进去的，还是本来就有的」。
    *   Prisma 的 upsert 不告诉你命中与否，所以改成 create + 捕获主键冲突：
    *   撞主键（P2002）就等于「之前已经收到过」，结果与旧实现一致，且只发一条 SQL。
+   *
+   * W3 起多了一步：**写库成功后**往归并队列投一条 job（见 enqueue）。
+   * 顺序不能反 —— 先入队的话，Worker 可能比写库更快地拿到一个还查不到的主键。
+   * 两步之间刻意不做跨系统事务（Redis 与 PG 之间没有可靠的两阶段提交，硬凑出来的
+   * "事务"只会在其中一边挂着时留下更难查的状态）。代价是"入库成功但入队失败"，
+   * 由补扫任务兜住。
    */
   async ingest(payload: IngestErrorDto): Promise<IngestResult> {
     this.logIncoming(payload);
 
     try {
       await this.prisma.errorEvent.create({ data: this.toRow(payload) });
-      return { event_id: payload.event_id, duplicate: false };
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError) {
         // event_id 就是主键，所以撞唯一约束只可能是"这条事件重复上报"
@@ -72,6 +89,42 @@ export class ErrorEventsService {
         }
       }
       throw err;
+    }
+
+    await this.enqueue(payload.event_id);
+
+    return { event_id: payload.event_id, duplicate: false };
+  }
+
+  /**
+   * 投递一条归并任务。
+   *
+   * ── jobId 用 event_id ──────────────────────────────────────────────────
+   * 队列里同 jobId 的 job 还在时，BullMQ 会**静默忽略**这次 add（不报错、也不新建，
+   * 见 addStandardJob-9.js 的 handleDuplicatedJob），这是防重复入队的第一道闸。
+   * 注意它是"静默"的：别指望靠 catch 判断有没有入队成功。
+   * 形状不合法的 id（纯数字 / 含冒号）由 toJobId 先映射成合法形状。
+   *
+   * ── 失败为什么只记日志、不往上抛 ────────────────────────────────────────
+   * 事件已经落库了，真相保住了；入队失败只意味着"暂时没人处理它"，由补扫任务兜住。
+   * 反过来若抛出去：SDK 收到 500 会重试，而重试撞主键会被判成 duplicate、
+   * 在下面那条 duplicate 分支里直接返回 —— 照样不会入队，还多绕一圈。
+   *
+   * ── 只有新事件才入队 ───────────────────────────────────────────────────
+   * duplicate 分支不入队：这条事件上一次已经入过队（jobId 相同，去重窗口内会被
+   * 静默忽略），真要是上次入队失败，补扫会按 processed_at IS NULL 把它捞回来。
+   */
+  private async enqueue(eventId: string): Promise<void> {
+    try {
+      await this.queue.add(
+        ERROR_EVENT_JOB,
+        { eventId },
+        { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(eventId) },
+      );
+    } catch (err) {
+      this.logger.error(
+        `入队失败，事件已入库但尚未归并（等补扫兜住）: event_id=${eventId} 原因=${String(err)}`,
+      );
     }
   }
 
@@ -116,6 +169,96 @@ export class ErrorEventsService {
       ...(payload.breadcrumbs
         ? { breadcrumbs: payload.breadcrumbs as Prisma.InputJsonValue }
         : {}),
+    };
+  }
+
+  /**
+   * 分页查询异常事件，按事件时间倒序。
+   *
+   * 响应形状（字段统一 snake_case，与 SDK 上报契约、ingest 响应保持一致）：
+   * {
+   *   items: [{
+   *     event_id, mechanism, type, message, stack, source,
+   *     timestamp, received_at, url, user_agent,
+   *     sdk_name, sdk_version,
+   *     exception_type, exception_value, exception_mechanism,
+   *     stacktrace_raw, stacktrace_frames,
+   *     user_id, session_id, release, environment,
+   *     tags, extra, breadcrumbs,
+   *   }],
+   *   total, page, pageSize,
+   * }
+   *
+   * 两个刻意的选择：
+   *   ① orderBy 用 timestamp 而不是 received_at —— 表上只有
+   *      @@index([timestamp(sort: Desc)])，换字段就是全表 sort
+   *   ② 列表与总数放进同一个 $transaction —— 同一事务快照，并发写入时不会
+   *      出现"total=10 但翻到第 2 页是空的"这种自相矛盾
+   *
+   * 过渡接口：暂无 projectId 过滤（表里还没有 project_id 列）。
+   * 另注：count() 在几十万行时是全表扫描，M2 之后趋势类查询改读预聚合表。
+   */
+  async listErrorEvents(page: number, pageSize: number) {
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.errorEvent.findMany({
+        orderBy: { timestamp: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.errorEvent.count(),
+    ]);
+
+    return {
+      items: rows.map((row) => this.toApiRow(row)),
+      total,
+      page,
+      pageSize,
+    };
+  }
+
+  /**
+   * 数据库行 → 接口响应。
+   *
+   * 为什么不直接 return rows：Prisma 返回的是内部模型形状，以后给表加了仅供
+   * 内部使用的列，它会自动出现在响应里。字段在这里显式列出 = 接口契约由这里定。
+   *
+   * 三处不用特殊处理：
+   *   · Date 经 JSON.stringify 自动序列化成 ISO 8601 UTC 字符串（符合 SRS §8）
+   *   · Json 列的 null 保持 null，不会被抹成缺字段
+   *   · 本表没有 BigInt 列，不会踩 JSON.stringify 不支持 BigInt 的坑
+   */
+  private toApiRow(row: ErrorEvent) {
+    return {
+      event_id: row.eventId,
+      mechanism: row.mechanism,
+      type: row.type,
+      message: row.message,
+      stack: row.stack,
+      source: row.source,
+      timestamp: row.timestamp,
+      received_at: row.receivedAt,
+      url: row.url,
+      user_agent: row.userAgent,
+      sdk_name: row.sdkName,
+      sdk_version: row.sdkVersion,
+      exception_type: row.exceptionType,
+      exception_value: row.exceptionValue,
+      exception_mechanism: row.exceptionMechanism,
+      stacktrace_raw: row.stacktraceRaw,
+      stacktrace_frames: row.stacktraceFrames,
+      user_id: row.userId,
+      session_id: row.sessionId,
+      release: row.release,
+      environment: row.environment,
+      tags: row.tags,
+      extra: row.extra,
+      breadcrumbs: row.breadcrumbs,
+      /// 归并到的问题 ID，NULL = 尚未归并（M1 阶段恒为 NULL）。
+      /// 看板拿它多显示一列，但**默认列表不做任何过滤** ——
+      /// 一旦按 group_id IS NULL 过滤，Worker 归并得越成功、看板就越空。
+      group_id: row.groupId,
+      // processed_at 有意不暴露：它是 Worker 的幂等闸门（内部进度），
+      // 不是给用户看的"已读"标记。暴露它等于让处理进度决定用户能看到什么。
     };
   }
 }
