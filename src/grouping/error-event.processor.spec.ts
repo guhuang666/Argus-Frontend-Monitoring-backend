@@ -56,11 +56,14 @@ const CLAIMED: ClaimedEvent = {
 function fakePrisma(behavior: {
   claimed?: ClaimedEvent | null;
   existing?: { processedAt: Date | null } | null;
+  /** upsert 后返回的 status，用来驱动 FR-4.8 的回归分支。默认 unresolved */
+  groupStatus?: 'unresolved' | 'resolved' | 'ignored' | 'archived';
 }) {
   const rows = behavior.claimed ? [behavior.claimed] : [];
   const calls: string[] = [];
   let upsertArgs: { where: unknown; create: Record<string, unknown> } | null = null;
   let updateArgs: { data: Record<string, unknown> } | null = null;
+  let groupUpdateArgs: { data: Record<string, unknown> } | null = null;
 
   return {
     calls,
@@ -71,6 +74,10 @@ function fakePrisma(behavior: {
     /** 回填时 errorEvent.update 的入参，供断言 groupId 用 */
     get updateArgs() {
       return updateArgs;
+    },
+    /** 状态回归时 errorGroup.update 的入参（只有 resolved 才有） */
+    get groupUpdateArgs() {
+      return groupUpdateArgs;
     },
     $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
       calls.push('tx:begin');
@@ -85,7 +92,17 @@ function fakePrisma(behavior: {
             calls.push('tx:upsertGroup');
             upsertArgs = args as { where: unknown; create: Record<string, unknown> };
             // timesSeen 返回 2n：模拟"这是第二次发生"，顺便验证 bigint 拼进日志不报错
-            return { id: 'group-1', timesSeen: 2n };
+            return {
+              id: 'group-1',
+              timesSeen: 2n,
+              status: behavior.groupStatus ?? 'unresolved',
+            };
+          },
+          // FR-4.8：只有 status 已经是 resolved 时才会走这一步
+          update: async (args: unknown) => {
+            calls.push('tx:regressGroup');
+            groupUpdateArgs = args as { data: Record<string, unknown> };
+            return {};
           },
         },
         errorEvent: {
@@ -206,6 +223,35 @@ describe('ErrorEventProcessor', () => {
       const consumed = logged.find((l) => l.includes('已消费'));
       expect(consumed).toContain('group=group-1');
       expect(consumed).toContain('times=2');
+    });
+
+    it('已解决的问题又收到事件 → 回归未处理（FR-4.8）', async () => {
+      const prisma = fakePrisma({ claimed: CLAIMED, groupStatus: 'resolved' });
+
+      await build(prisma, fakeDlq()).process(jobLike({}));
+
+      // 归并之后多一次 errorGroup.update：把 status 拉回 unresolved 并清空 resolved_at
+      expect(prisma.calls).toEqual([
+        'tx:begin',
+        'tx:claim',
+        'tx:upsertGroup',
+        'tx:regressGroup',
+        'tx:updateEvent',
+      ]);
+      expect(prisma.groupUpdateArgs?.data).toMatchObject({
+        status: 'unresolved',
+        resolvedAt: null,
+      });
+      expect(logged.some((l) => l.includes('问题回归'))).toBe(true);
+    });
+
+    it('未解决的问题不触发回归写入（省掉一次写）', async () => {
+      const prisma = fakePrisma({ claimed: CLAIMED, groupStatus: 'unresolved' });
+
+      await build(prisma, fakeDlq()).process(jobLike({}));
+
+      expect(prisma.calls).not.toContain('tx:regressGroup');
+      expect(prisma.groupUpdateArgs).toBeNull();
     });
 
     it('没抢到闸门时绝不写库（不 upsert、不回填）', async () => {

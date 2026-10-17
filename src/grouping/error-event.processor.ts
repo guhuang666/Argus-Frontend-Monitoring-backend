@@ -175,6 +175,20 @@ export class ErrorEventProcessor extends WorkerHost {
         },
       });
 
+      // ── FR-4.8 状态机：已解决的问题又出事 → 回归为未处理 ────────────
+      // upsert 返回的是写入后的行，所以这里读到的 status 就是最新状态。
+      // 只在 resolved 时多做一次写：这是稀有路径，不值得为它把 upsert
+      // 改写成带 CASE 的手写 SQL。
+      // 注：日志在事务内打。万一后面回滚，这行会成为"说过但没发生"；
+      // 考虑到它会随重试再打一遍，且状态可在 GET /issues 里直接核对，接受。
+      if (group.status === 'resolved') {
+        await tx.errorGroup.update({
+          where: { id: group.id },
+          data: { status: 'unresolved', resolvedAt: null },
+        });
+        this.logger.log(`问题回归: id=${group.id} resolved → unresolved（收到新事件）`);
+      }
+
       await tx.errorEvent.update({
         where: { eventId },
         data: {

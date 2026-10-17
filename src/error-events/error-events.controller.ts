@@ -1,36 +1,10 @@
 import { Body, Controller, Get, Post, Query } from '@nestjs/common';
-import { Type } from 'class-transformer';
-import { IsInt, IsOptional, Max, Min } from 'class-validator';
+import { PageQueryDto } from '../common/dto/page-query.dto';
 import { IngestErrorDto } from './dto/ingest-error.dto';
 import { ErrorEventsService } from './error-events.service';
 // interface 只用于类型，在装饰器签名里必须用 import type，
 // 否则 isolatedModules + emitDecoratorMetadata 会报错
 import type { IngestResult } from './error-events.service';
-
-/**
- * 分页参数。
- *
- * 为什么这个类定义在 controller 里而不是 dto/ 目录：本阶段约定不新增文件。
- * performance.controller.ts 里有一份相同副本 —— 改动请同步两边；
- * 出现第 3 个读接口时，就是把它抽到共享位置的时机。
- *
- * ⚠️ @Type(() => Number) 不能省：main.ts 里的 ValidationPipe 关掉了
- * enableImplicitConversion，query 参数到手是字符串，"2" 过不了 @IsInt()。
- */
-class PageQueryDto {
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  page: number = 1;
-
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(100)
-  pageSize: number = 20;
-}
 
 /**
  * 异常事件：上报 + 查询。
@@ -41,6 +15,9 @@ class PageQueryDto {
  *
  * `api/v1` 统一放在 @Controller 前缀上，路由字符串里不再重复写 v1 ——
  * 也就不会再出现"新加路由忘了带 v1"这种事（SRS §8 要求统一前缀）。
+ *
+ * 分页参数：原先本文件里有一份 PageQueryDto 副本，issues 成为第 3 个读接口后
+ * 按注释里的约定抽到了 common/dto/page-query.dto.ts，这里改为 import。
  */
 @Controller('api/v1')
 export class ErrorEventsController {
@@ -63,9 +40,9 @@ export class ErrorEventsController {
    * GET /api/v1/error?page=&pageSize=
    * 分页查询异常事件，按事件时间倒序，返回 { items, total, page, pageSize }。
    *
-   * 过渡接口：暂时没有 projectId 过滤（表里还没有 project_id 列），
-   * 目的只是把已经上报的数据读出来。M2 引入 error_groups / project_id 后，
-   * 由 /api/v1/projects/:projectId/issues 取代。
+   * 过渡接口：暂时没有 projectId 过滤（表里还没有 project_id 列）。
+   * 想看"归并后的结果"请用 GET /api/v1/issues —— 那是 M2 的问题列表；
+   * 本接口的用途是"看原始事件明细"，也是问题详情页下钻的兜底。
    */
   @Get('error')
   list(@Query() query: PageQueryDto) {

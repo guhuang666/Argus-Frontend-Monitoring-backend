@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ErrorEventsModule } from './error-events/error-events.module';
+import { IssuesModule } from './issues/issues.module';
 import { PerformanceModule } from './performance/performance.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { QueryModule } from './query/query.module';
@@ -16,6 +17,10 @@ import { QueryModule } from './query/query.module';
     PrismaModule,
     ErrorEventsModule,
     PerformanceModule,
+    // 问题管理（M2 的读接口 + 状态流转）。
+    // 只有 API 进程需要它；worker.ts 的 WorkerModule 刻意不 import ——
+    // 反过来 grouping.module.ts 也刻意不进这里，两边进程分工不能混。
+    IssuesModule,
     QueryModule,
   ],
   controllers: [AppController],
