@@ -52,6 +52,10 @@ pids
 *.seed
 *.pid.lock
 
+# Sourcemap 上传落盘的原始 .map（M3）
+# 不入库：单个动辄几 MB，且随时可由 CLI 重新上传；DB 只存相对路径
+/uploads/
+
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 

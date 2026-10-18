@@ -153,6 +153,11 @@ export class ErrorEventsService {
       userAgent: payload.user_agent ?? '',
       sdkName: payload.sdk?.name ?? null,
       sdkVersion: payload.sdk?.version ?? null,
+      // 版本与环境：M3 的 Sourcemap 按 release 找 map（FR-3.4）。
+      // 这里漏了不会报任何错，只会让 error_events.release 恒为 NULL ——
+      // 直到做「受控重算」时才发现历史数据全都无从匹配
+      release: payload.release ?? null,
+      environment: payload.environment ?? null,
       // exception.* 是给读取侧归一化/指纹用的同一份数据（原始契约在上面那几列）
       exceptionType: payload.type,
       exceptionValue: payload.message,

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
-import { ErrorEventProcessor } from './error-event.processor';
 import { QueueModule } from '../queue/queue.module';
+import { ErrorEventProcessor } from './error-event.processor';
+import { SourcemapLookupService } from './sourcemap-lookup.service';
 
 /**
  * 归并（M2）—— 消息归一化、指纹、问题聚合。
@@ -19,7 +20,9 @@ import { QueueModule } from '../queue/queue.module';
  */
 @Module({
   imports: [QueueModule],
-  providers: [ErrorEventProcessor],
+  // SourcemapLookupService 只给 Worker 用（查 sourcemap_files + 读 uploads/），
+  // 放在这里而不是 sourcemaps/：那个目录是 API 进程的上传侧，两边的依赖不该混
+  providers: [ErrorEventProcessor, SourcemapLookupService],
   exports: [ErrorEventProcessor],
 })
 export class GroupingModule {}

@@ -261,3 +261,61 @@ model PerformanceMetric {
   @@index([timestamp(sort: Desc)])
   @@map("performance_metrics")
 }
+
+/// 发布版本 —— 一次构建产物的标识，Sourcemap 按它归属（FR-3 / M3）
+///
+/// 与 error_events.release 的关系是**逻辑外键，不是数据库外键**：
+/// 客户端报上来的版本号可能还没登记（先上线、后补传 map），硬加外键会让这种事件
+/// 直接写不进去 —— 丢一条错误比丢一次 map 匹配严重得多。所以两边都只存字符串，
+/// 由 Worker 在符号化时按 (version, artifact_path) 现查。
+///
+/// ⚠ MVP 阶段同样去掉了 project_id（与 ErrorGroup 同一条理由，见其注释）。
+/// 加回多项目时 project_id **必须 NOT NULL**，否则会精确复现 schema.prisma 里
+/// ErrorGroup 那段记的坑：唯一索引把 NULL 视为互不相同，同一个版本能插进任意多行。
+model Release {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 版本号，如 web@1.2.4。**必须与 SDK initArgus({release}) 上报的字符串逐字节一致**，
+  /// 这是 Worker 从 error_events.release 查到本行的唯一依据
+  version String @unique @db.VarChar(100)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  sourcemapFiles SourcemapFile[]
+
+  @@map("releases")
+}
+
+/// 产物文件 → Sourcemap 的对应关系，一行 = 一个待还原的 artifact（FR-3.2）
+///
+/// 主键是 id，但**真正的查找键是 (release_id, artifact_path)**：
+/// Worker 拿到一帧的 filename，剥掉 origin / query / :line:col 之后按这对键查。
+/// 这就是 FR-3.4「按 release 匹配 Sourcemap」在数据层的落地形式。
+model SourcemapFile {
+  id        String @id @default(uuid()) @db.Uuid
+  releaseId String @map("release_id") @db.Uuid
+
+  /// 产物路径，**统一存以 / 开头的 pathname**：/assets/index-a1b2c3.js
+  ///
+  /// 三条不许存（与 CLI 上传侧、Worker 查找侧必须是同一套规则，改动需三方同步）：
+  ///   · 不带 origin —— 同一份产物可能被 localhost / CDN / 预发域名加载，
+  ///     带 origin 会让同一条记录分裂成多条，Worker 永远匹配不上
+  ///   · 不带 query —— 版本化参数（?v=2）不属于文件身份
+  ///   · 不带 :line:col —— 那是堆栈里的位置，不是文件路径
+  artifactPath String @map("artifact_path") @db.VarChar(500)
+
+  /// map 内容的存放位置（磁盘相对路径 / 对象存储 key），**不是**产物在 CDN 上的 URL。
+  /// map 不进 DB：单个动辄几 MB，塞进行里会让每次查询都背着它
+  sourcemapPath String @map("sourcemap_path") @db.VarChar(500)
+
+  sizeBytes BigInt @map("size_bytes")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  /// Cascade：FR-3.10 要能整体清掉过期 release 的 map，删版本时不该留下孤儿行
+  release Release @relation(fields: [releaseId], references: [id], onDelete: Cascade)
+
+  /// 幂等重传靠它做 upsert：同版本同路径再次上传 = 覆盖，不新增行（FR-3.3）
+  @@unique([releaseId, artifactPath])
+  @@map("sourcemap_files")
+}

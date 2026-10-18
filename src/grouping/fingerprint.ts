@@ -30,7 +30,9 @@
  *    通常还有函数名和 message 参与区分，且过度归并方向同上。
  *
  * ── 刻意**不**参与签名的东西 ────────────────────────────────────────────
- *   · 行号 / 列号：任何一次编辑都会平移，参与就是每次提交换一批指纹
+ *   · 行号 / 列号：任何一次编辑都会平移，参与就是每次提交换一批指纹。
+ *     M3 起 Frame **保留**它们（符号化查 Sourcemap 必须有位置），但保留 ≠ 参与：
+ *     frameSignature() 只取 file / fn，见 Frame 的注释
  *   · 超过 FRAME_LIMIT 的深层帧：深栈里的框架内部帧与业务无关，且长度抖动大
  *   · 完整 message：它已经单独作为 canonical 的一段参与，且经归一化处理
  */
@@ -46,14 +48,27 @@ import { normalizeMessage } from './normalize';
  * 「同一条错误在新旧算法下可以并存」的开关（FR-4.12：M3 做符号化重算时靠它
  * 保证历史 times_seen 不断档）。
  *
+ * 两个版本并存（M3）：
+ *   · `v1-raw`          指纹输入是**压缩产物**的文件名 / 函数名（没有 Sourcemap 时）
+ *   · `v2-symbolicated` 指纹输入是**符号化后**的源码路径 / 函数名（有 Sourcemap 时）
+ * 同一事件按"能不能符号化"二选一，绝不混用 —— 版本号就是这次选择的记录。
+ *
  * **改 normalize.ts 的 RULES、或改本文件任何影响 canonical 的逻辑，
- * 都必须同步 bump 这个常量。** 否则同一个 version 下混进两套指纹，
- * 唯一索引挡不住，归并会静默漂移 —— 这类问题事后极难查。
+ * 都必须同步 bump 对应版本的常量（或再加一个新版本）。** 否则同一个 version 下
+ * 混进两套指纹，唯一索引挡不住，归并会静默漂移 —— 这类问题事后极难查。
  */
-export const GROUPING_VERSION = 'v1-raw';
+export const GROUPING_VERSION_RAW = 'v1-raw';
+
+/**
+ * 符号化后的指纹版本。
+ *
+ * 注意：**算它的函数不在本文件**（在 symbolicate.ts）—— 它的输入是
+ * SymbolicatedFrame，而本文件不该反过来依赖符号化模块（会成环）。
+ */
+export const GROUPING_VERSION_SYMBOLICATED = 'v2-symbolicated';
 
 /** 参与签名的帧数上限。取 3：够区分调用路径，又不至于被深栈抖动带偏 */
-const FRAME_LIMIT = 3;
+export const FRAME_LIMIT = 3;
 
 /** error_groups.title 是 varchar(500) */
 const TITLE_LIMIT = 500;
@@ -61,7 +76,11 @@ const TITLE_LIMIT = 500;
 /** error_groups.culprit 是 varchar(500)。文件名一般不超长，但栈是外部输入 */
 const CULPRIT_LIMIT = 500;
 
-/** 一帧。字段只保留指纹用得上的两样：文件与函数名 */
+/**
+ * 一帧。
+ *
+ * file / fn 参与指纹；line / col **只给 M3 的符号化用**，不进签名。
+ */
 export interface Frame {
   /**
    * 栈原文里的位置，**保留原样**：可能带 origin、端口、目录、query。
@@ -70,6 +89,25 @@ export interface Frame {
   file: string;
   /** 函数名；匿名帧为 null（不是空串 —— 空串会被误认为"有个叫空的函数"） */
   fn: string | null;
+  /**
+   * 压缩产物里的行号（浏览器 / Node 报的 **1-based**，原样存）。
+   *
+   * 为什么必须留：查 Sourcemap 的入参只有 `{ line, column }`，光有文件名
+   * 什么也查不出来 —— 压缩后整个应用挤在一行里，只有列号能定位。
+   *
+   * 为什么它**绝不能进签名**：任何一次编辑都会平移行号，拼进 canonical
+   * 就等于每次发版换一批指纹，M2 归并出来的历史问题会当场作废。
+   * frameSignature() 只取 file / fn，正是为了守住这条线（见 FRAME_LIMIT 上方注释）。
+   */
+  line: number;
+  /**
+   * 压缩产物里的列号（同样是 1-based，原样存）。
+   *
+   * ⚠️ Sourcemap 规范要求的是 **0-based 列号**，所以查表时必须 `col - 1`。
+   * 这里刻意**不在解析阶段就减**：解析结果的职责是"忠实记录浏览器说了什么"，
+   * 提前转换会让这个字段的基准变得含糊，以后没人说得清它到底是哪套。
+   */
+  col: number;
 }
 
 /**
@@ -116,7 +154,9 @@ export function parseFrames(stack?: string | null): Frame[] {
       file = file.replace(/^async\s+/, '');
     }
 
-    frames.push({ file, fn });
+    // 行列号原样保留（1-based）。它们只给 M3 符号化用，不进 frameSignature ——
+    // 见 Frame 的注释：保留 ≠ 参与
+    frames.push({ file, fn, line: Number(m[3]), col: Number(m[4]) });
   }
   return frames;
 }
@@ -197,6 +237,9 @@ function frameFile(file: string): string {
  * 保证"1000 张图失败 → 1 个问题"。
  */
 export function frameSignature(frames: Frame[]): string {
+  // ⚠️ 这个 map 把每帧**重新构造成只含 file / fn 的对象**，是刻意的护栏：
+  // Frame 自 M3 起还带 line / col，但签名绝不能看见它们（否则每次编辑换一批指纹，
+  // M2 归并出的历史问题会当场作废）。别把它"优化"成直接传 frame 或 `{...frame}`。
   return frames
     .map((frame) => ({ file: frameFile(frame.file), fn: frame.fn }))
     .filter((frame) => frame.file !== '')

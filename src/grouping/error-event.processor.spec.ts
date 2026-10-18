@@ -3,6 +3,9 @@ import type { Job, Queue } from 'bullmq';
 import type { PrismaService } from '../prisma/prisma.service';
 import { DLQ_JOB_OPTIONS, ERROR_EVENT_JOB } from '../queue/queue.constants';
 import { ErrorEventProcessor } from './error-event.processor';
+import type { Frame } from './fingerprint';
+import type { SourcemapLookupService } from './sourcemap-lookup.service';
+import { symbolicateFrames } from './symbolicate';
 
 /**
  * 三处核心逻辑，离线验证：
@@ -39,6 +42,8 @@ interface ClaimedEvent {
   message: string;
   stack: string | null;
   timestamp: Date;
+  /** M3：归并时用它找 Sourcemap；null = 没配版本，直接走 v1 */
+  release: string | null;
 }
 
 const CLAIMED: ClaimedEvent = {
@@ -50,6 +55,7 @@ const CLAIMED: ClaimedEvent = {
   stack:
     'TypeError: x\n    at renderSummary (http://127.0.0.1:8017/assets/index-a1b2c3.js:348:13)',
   timestamp: new Date('2026-01-01T00:00:00Z'),
+  release: null,
 };
 
 /** 假 Prisma：$transaction 直接把 tx 交给回调，$queryRaw 返回预置的声明结果 */
@@ -61,7 +67,8 @@ function fakePrisma(behavior: {
 }) {
   const rows = behavior.claimed ? [behavior.claimed] : [];
   const calls: string[] = [];
-  let upsertArgs: { where: unknown; create: Record<string, unknown> } | null = null;
+  let upsertArgs: { where: unknown; create: Record<string, unknown> } | null =
+    null;
   let updateArgs: { data: Record<string, unknown> } | null = null;
   let groupUpdateArgs: { data: Record<string, unknown> } | null = null;
 
@@ -90,7 +97,10 @@ function fakePrisma(behavior: {
         errorGroup: {
           upsert: async (args: unknown) => {
             calls.push('tx:upsertGroup');
-            upsertArgs = args as { where: unknown; create: Record<string, unknown> };
+            upsertArgs = args as {
+              where: unknown;
+              create: Record<string, unknown>;
+            };
             // timesSeen 返回 2n：模拟"这是第二次发生"，顺便验证 bigint 拼进日志不报错
             return {
               id: 'group-1',
@@ -125,11 +135,18 @@ function fakePrisma(behavior: {
 
 /** 假 DLQ：记录 add 的入参，可选抛错 */
 function fakeDlq(behavior: { add?: () => Promise<unknown> } = {}) {
-  const added: Array<{ name: string; data: Record<string, unknown>; opts: Record<string, unknown> }> =
-    [];
+  const added: Array<{
+    name: string;
+    data: Record<string, unknown>;
+    opts: Record<string, unknown>;
+  }> = [];
   return {
     added,
-    add: async (name: string, data: Record<string, unknown>, opts: Record<string, unknown>) => {
+    add: async (
+      name: string,
+      data: Record<string, unknown>,
+      opts: Record<string, unknown>,
+    ) => {
       if (behavior.add) return behavior.add();
       added.push({ name, data, opts });
       return { id: opts.jobId };
@@ -137,10 +154,57 @@ function fakeDlq(behavior: { add?: () => Promise<unknown> } = {}) {
   };
 }
 
-function build(prisma: ReturnType<typeof fakePrisma>, dlq: ReturnType<typeof fakeDlq>) {
+/**
+ * 默认的符号化服务：永远"找不到 map"。
+ *
+ * 本文件里绝大多数断言描述的是 **v1 路径**（压缩位置指纹），
+ * 让默认实现全部降级，等价于"这个 release 没上传 Sourcemap"。
+ */
+const DEGRADED_LOOKUP = {
+  symbolicate: (_db: unknown, _release: string | null, frames: Frame[]) =>
+    Promise.resolve(symbolicateFrames(frames, () => null)),
+} as unknown as SourcemapLookupService;
+
+/**
+ * 假的符号化服务：release 有值时所有帧都还原成功，release 为 null 时降级。
+ *
+ * 必须镜像真实服务的前置判断（SourcemapLookupService 在 release === null 时
+ * 直接返回全降级结果），否则"没版本 → 不走 v2"这条测试等于没测。
+ */
+function fullyResolvedLookup(): SourcemapLookupService {
+  return {
+    symbolicate: (_db: unknown, release: string | null, frames: Frame[]) => {
+      if (release === null) {
+        return Promise.resolve(symbolicateFrames(frames, () => null));
+      }
+      return Promise.resolve({
+        frames: frames.map((frame) => ({
+          ...frame,
+          artifactPath: '/assets/index.js',
+          resolved: true,
+          source: 'src/pages/OrderList.tsx',
+          sourceLine: 87,
+          sourceCol: 12,
+          name: 'OrderList',
+          context: null,
+        })),
+        resolvedCount: frames.length,
+        withFileCount: frames.length,
+        allResolved: frames.length > 0,
+      });
+    },
+  } as unknown as SourcemapLookupService;
+}
+
+function build(
+  prisma: ReturnType<typeof fakePrisma>,
+  dlq: ReturnType<typeof fakeDlq>,
+  lookup: SourcemapLookupService = DEGRADED_LOOKUP,
+) {
   return new ErrorEventProcessor(
     prisma as unknown as PrismaService,
     dlq as unknown as Queue,
+    lookup,
   );
 }
 
@@ -180,7 +244,9 @@ describe('ErrorEventProcessor', () => {
       await build(prisma, dlq).process(jobLike({}));
 
       expect(prisma.calls).toContain('tx:claim');
-      expect(logged.some((l) => l.includes('已消费') && l.includes('evt-1'))).toBe(true);
+      expect(
+        logged.some((l) => l.includes('已消费') && l.includes('evt-1')),
+      ).toBe(true);
       // 声明成功不该去查"为什么没抢到"（少一次查询）
       expect(prisma.calls).not.toContain('db:findUnique');
     });
@@ -203,14 +269,14 @@ describe('ErrorEventProcessor', () => {
       expect(prisma.upsertArgs?.where).toMatchObject({
         groupingVersion_fingerprint: {
           groupingVersion: 'v1-raw',
-          fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) as unknown as string,
+          fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
         },
       });
 
       // 首次创建：计数从 1 开始，首末时间都取自事件时间
       expect(prisma.upsertArgs?.create).toMatchObject({
         groupingVersion: 'v1-raw',
-        title: expect.stringContaining('TypeError:') as unknown as string,
+        title: expect.stringContaining('TypeError:'),
         culprit: 'index.js:renderSummary',
         timesSeen: 1,
       });
@@ -223,6 +289,56 @@ describe('ErrorEventProcessor', () => {
       const consumed = logged.find((l) => l.includes('已消费'));
       expect(consumed).toContain('group=group-1');
       expect(consumed).toContain('times=2');
+    });
+
+    it('M3：能符号化时整条切到 v2 —— 版本、指纹输入、culprit 都换成源码', async () => {
+      const claimed: ClaimedEvent = { ...CLAIMED, release: 'web@1.0.0' };
+      const prisma = fakePrisma({ claimed });
+
+      await build(prisma, fakeDlq(), fullyResolvedLookup()).process(
+        jobLike({}),
+      );
+
+      // 分组版本换成 v2（与 v1 并存，不覆盖历史问题）
+      expect(prisma.upsertArgs?.where).toMatchObject({
+        groupingVersion_fingerprint: {
+          groupingVersion: 'v2-symbolicated',
+          fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+        },
+      });
+      expect(prisma.upsertArgs?.create).toMatchObject({
+        groupingVersion: 'v2-symbolicated',
+        // culprit 用源码路径 + 源码函数名，而不是 index.js:renderSummary
+        culprit: 'src/pages/OrderList.tsx:OrderList',
+      });
+
+      // 落库的是符号化后的帧（带 source / sourceLine），不是压缩帧
+      const frames = prisma.updateArgs?.data.stacktraceFrames as Array<
+        Record<string, unknown>
+      >;
+      expect(frames[0]).toMatchObject({
+        resolved: true,
+        source: 'src/pages/OrderList.tsx',
+        sourceLine: 87,
+      });
+
+      // 日志里 ver=v2，验收时一眼能看出符号化有没有生效
+      expect(logged.some((l) => l.includes('ver=v2'))).toBe(true);
+    });
+
+    it('M3：没有 release 时不做符号化，仍然走 v1（与 M2 行为一致）', async () => {
+      // CLAIMED.release = null；即使 lookup 能还原，也不该被调用出 v2 结果
+      const prisma = fakePrisma({ claimed: CLAIMED });
+
+      await build(prisma, fakeDlq(), fullyResolvedLookup()).process(
+        jobLike({}),
+      );
+
+      // lookup 收到 null release 时会返回 allResolved=false，所以仍是 v1
+      expect(prisma.upsertArgs?.create).toMatchObject({
+        groupingVersion: 'v1-raw',
+      });
+      expect(logged.some((l) => l.includes('ver=v1'))).toBe(true);
     });
 
     it('已解决的问题又收到事件 → 回归未处理（FR-4.8）', async () => {
@@ -246,7 +362,10 @@ describe('ErrorEventProcessor', () => {
     });
 
     it('未解决的问题不触发回归写入（省掉一次写）', async () => {
-      const prisma = fakePrisma({ claimed: CLAIMED, groupStatus: 'unresolved' });
+      const prisma = fakePrisma({
+        claimed: CLAIMED,
+        groupStatus: 'unresolved',
+      });
 
       await build(prisma, fakeDlq()).process(jobLike({}));
 
@@ -255,7 +374,10 @@ describe('ErrorEventProcessor', () => {
     });
 
     it('没抢到闸门时绝不写库（不 upsert、不回填）', async () => {
-      const prisma = fakePrisma({ claimed: null, existing: { processedAt: new Date() } });
+      const prisma = fakePrisma({
+        claimed: null,
+        existing: { processedAt: new Date() },
+      });
 
       await build(prisma, fakeDlq()).process(jobLike({}));
 
@@ -265,10 +387,15 @@ describe('ErrorEventProcessor', () => {
     });
 
     it('没抢到且事件已处理过 → 只 debug 跳过，不报错', async () => {
-      const prisma = fakePrisma({ claimed: null, existing: { processedAt: new Date() } });
+      const prisma = fakePrisma({
+        claimed: null,
+        existing: { processedAt: new Date() },
+      });
       const dlq = fakeDlq();
 
-      await expect(build(prisma, dlq).process(jobLike({}))).resolves.toBeUndefined();
+      await expect(
+        build(prisma, dlq).process(jobLike({})),
+      ).resolves.toBeUndefined();
 
       expect(prisma.calls).toContain('db:findUnique');
       expect(logged.some((l) => l.includes('已处理过'))).toBe(true);
@@ -296,16 +423,24 @@ describe('ErrorEventProcessor', () => {
     it('还有重试次数 → 只 warn，不转 DLQ', async () => {
       const dlq = fakeDlq();
 
-      await build(fakePrisma({}), dlq).onFailed(jobLike({ attemptsMade: 1, attempts: 3 }), new Error('boom'));
+      await build(fakePrisma({}), dlq).onFailed(
+        jobLike({ attemptsMade: 1, attempts: 3 }),
+        new Error('boom'),
+      );
 
       expect(dlq.added).toEqual([]);
-      expect(logged.some((l) => l.includes('第 1/3 次失败，将重试'))).toBe(true);
+      expect(logged.some((l) => l.includes('第 1/3 次失败，将重试'))).toBe(
+        true,
+      );
     });
 
     it('重试耗尽（attemptsMade === attempts）→ 转入 DLQ', async () => {
       const dlq = fakeDlq();
 
-      await build(fakePrisma({}), dlq).onFailed(jobLike({ attemptsMade: 3, attempts: 3 }), new Error('ECONNREFUSED'));
+      await build(fakePrisma({}), dlq).onFailed(
+        jobLike({ attemptsMade: 3, attempts: 3 }),
+        new Error('ECONNREFUSED'),
+      );
 
       expect(dlq.added).toHaveLength(1);
       expect(dlq.added[0].name).toBe(ERROR_EVENT_JOB);
@@ -315,7 +450,9 @@ describe('ErrorEventProcessor', () => {
         attemptsMade: 3,
       });
       expect(typeof dlq.added[0].data.failedAt).toBe('string');
-      expect(logged.some((l) => l.includes('已转入 DLQ') && l.includes('evt-1'))).toBe(true);
+      expect(
+        logged.some((l) => l.includes('已转入 DLQ') && l.includes('evt-1')),
+      ).toBe(true);
     });
 
     it('DLQ 的 jobId 带时间戳：同一事件再次失败不会被去重吃掉', async () => {
@@ -323,7 +460,10 @@ describe('ErrorEventProcessor', () => {
       const processor = build(fakePrisma({}), dlq);
 
       await processor.onFailed(jobLike({ attemptsMade: 3 }), new Error('boom'));
-      await processor.onFailed(jobLike({ attemptsMade: 3 }), new Error('boom again'));
+      await processor.onFailed(
+        jobLike({ attemptsMade: 3 }),
+        new Error('boom again'),
+      );
 
       expect(dlq.added).toHaveLength(2);
       const ids = dlq.added.map((entry) => entry.opts.jobId);
@@ -336,8 +476,9 @@ describe('ErrorEventProcessor', () => {
     it('拿不到 job 对象（反序列化失败）也不崩', async () => {
       const dlq = fakeDlq();
 
-      await expect(build(fakePrisma({}), dlq).onFailed(undefined, new Error('bad json'))).resolves
-        .toBeUndefined();
+      await expect(
+        build(fakePrisma({}), dlq).onFailed(undefined, new Error('bad json')),
+      ).resolves.toBeUndefined();
 
       expect(dlq.added).toEqual([]);
       expect(logged.some((l) => l.includes('拿不到 job 详情'))).toBe(true);
@@ -351,11 +492,16 @@ describe('ErrorEventProcessor', () => {
       });
 
       await expect(
-        build(fakePrisma({}), dlq).onFailed(jobLike({ attemptsMade: 3 }), new Error('原始原因')),
+        build(fakePrisma({}), dlq).onFailed(
+          jobLike({ attemptsMade: 3 }),
+          new Error('原始原因'),
+        ),
       ).resolves.toBeUndefined();
 
       expect(
-        logged.some((l) => l.includes('转入 DLQ 失败') && l.includes('原始原因')),
+        logged.some(
+          (l) => l.includes('转入 DLQ 失败') && l.includes('原始原因'),
+        ),
       ).toBe(true);
     });
 
@@ -375,6 +521,10 @@ describe('ErrorEventProcessor', () => {
 
     processor.onError(new Error('connect ECONNREFUSED 127.0.0.1:6379'));
 
-    expect(logged.some((l) => l.includes('Worker 异常') && l.includes('ECONNREFUSED'))).toBe(true);
+    expect(
+      logged.some(
+        (l) => l.includes('Worker 异常') && l.includes('ECONNREFUSED'),
+      ),
+    ).toBe(true);
   });
 });

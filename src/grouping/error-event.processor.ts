@@ -1,4 +1,9 @@
-import { InjectQueue, OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
+import {
+  InjectQueue,
+  OnWorkerEvent,
+  Processor,
+  WorkerHost,
+} from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import type { Job, Queue } from 'bullmq';
 import { randomUUID } from 'node:crypto';
@@ -17,9 +22,15 @@ import {
   buildCulprit,
   buildTitle,
   computeFingerprint,
-  GROUPING_VERSION,
+  GROUPING_VERSION_RAW,
+  GROUPING_VERSION_SYMBOLICATED,
   parseFrames,
 } from './fingerprint';
+import { SourcemapLookupService } from './sourcemap-lookup.service';
+import {
+  buildSymbolicatedCulprit,
+  computeSymbolicatedFingerprint,
+} from './symbolicate';
 
 /** 单进程并发度。归并是 DB 密集，先给 5；等有真实压测数据再按 PG 连接池上限调 */
 const CONCURRENCY = 5;
@@ -37,6 +48,14 @@ interface ClaimedEvent {
   stack: string | null;
   /** 事件发生时间（客户端时钟），作为 first_seen / last_seen 的来源 */
   timestamp: Date;
+  /**
+   * 上报时带的版本号，如 `web@1.4.2`。可空 —— SDK 允许不配版本。
+   *
+   * M3 起它是 Worker 找 Sourcemap 的**唯一坐标**（FR-3.4：按 release 匹配）。
+   * 少这一列不会报错，只会让符号化在第一步就以"查不到版本"的名义降级掉，
+   * 表现是看板上永远是"未符号化" —— 所以它必须跟着 RETURNING 回来。
+   */
+  release: string | null;
 }
 
 /** claim() 的产出：声明到的事件 + 归并结果（给日志用） */
@@ -45,6 +64,8 @@ interface ClaimOutcome {
   fingerprint: string;
   groupId: string;
   timesSeen: bigint;
+  /** 这条走的是 v2-symbolicated 还是退回 v1-raw —— 验收时一眼能看出符号化有没有生效 */
+  symbolicated: boolean;
 }
 
 /**
@@ -64,7 +85,8 @@ interface ClaimOutcome {
  *
  * ── MVP 有意留空的东西 ──────────────────────────────────────────────────
  *   · users_seen 恒为 0 —— 上报链路里没有 user_id（DTO 与 toRow 都不带）
- *   · first_release / last_release 恒为 NULL —— SDK 还不上报 release
+ *   · first_release / last_release 由上报的 release 填充（SDK 自 M3 起会带上）；
+ *     release 为空的事件**不会**把已有的版本列覆盖成 NULL（见 upsert 的 update）
  *   · first_seen 只在 create 时写 —— 乱序到达的旧事件不会把首见时间往前挪。
  *     这是主动接受的近似：要精确得用 LEAST()，而 Prisma 的 upsert 表达不了
  *   · 单项目 —— error_groups 已去掉 project_id（见 schema.prisma 顶部注释）
@@ -79,7 +101,9 @@ export class ErrorEventProcessor extends WorkerHost {
 
   constructor(
     private readonly prisma: PrismaService,
-    @InjectQueue(ERROR_EVENT_DLQ) private readonly dlq: Queue<ErrorEventDlqData>,
+    @InjectQueue(ERROR_EVENT_DLQ)
+    private readonly dlq: Queue<ErrorEventDlqData>,
+    private readonly sourcemaps: SourcemapLookupService,
   ) {
     super();
   }
@@ -101,12 +125,14 @@ export class ErrorEventProcessor extends WorkerHost {
       return;
     }
 
-    const { event, fingerprint, groupId, timesSeen } = outcome;
+    const { event, fingerprint, groupId, timesSeen, symbolicated } = outcome;
     // 日志带上 group / fingerprint / times：验收时不用查库就能看出
-    // 两条上报有没有落进同一个问题里
+    // 两条上报有没有落进同一个问题里。
+    // sym=v2/raw=v1 同理：符号化有没有生效，一条日志就能判断
     this.logger.log(
       `已消费 event_id=${eventId} group=${groupId.slice(0, 8)} ` +
         `fp=${fingerprint.slice(0, 8)} times=${timesSeen} ` +
+        `ver=${symbolicated ? 'v2' : 'v1'} ` +
         `mechanism=${event.mechanism} type=${event.type} ` +
         `message="${truncate(event.message, LOG_MESSAGE_LIMIT)}"`,
     );
@@ -133,7 +159,7 @@ export class ErrorEventProcessor extends WorkerHost {
            SET processed_at = now()
          WHERE event_id = ${eventId}
            AND processed_at IS NULL
-        RETURNING event_id, mechanism, "type", message, stack, timestamp
+        RETURNING event_id, mechanism, "type", message, stack, timestamp, release
       `;
 
       const claimed = rows[0];
@@ -141,34 +167,73 @@ export class ErrorEventProcessor extends WorkerHost {
       // 绝不能替别人（或上一次的自己）重复归并
       if (claimed === undefined) return null;
 
-      // ── 归并（W4）───────────────────────────────────────────────────
-      const fingerprint = computeFingerprint({
-        type: claimed.type,
-        message: claimed.message,
-        stack: claimed.stack,
-      });
+      // ── 归并（W4 / M3）─────────────────────────────────────────────
       const frames = parseFrames(claimed.stack);
+
+      // M3：有 release 才可能找到 Sourcemap；没有 / 找不到 / 只还原了一部分，
+      // 都会拿到 allResolved=false，此时整条退回 v1（压缩位置）指纹 ——
+      // 与 M2 的行为**完全一致**，不会因为引入了符号化而让历史问题分裂。
+      //
+      // 注意这一步在事务内、且用了同一个 tx：它要读 release / sourcemap_files，
+      // 另开连接会在并发高时把自己卡在连接池上。解析成本靠 service 内的缓存摊薄。
+      const resolution = await this.sourcemaps.symbolicate(
+        tx,
+        claimed.release,
+        frames,
+      );
+      const symbolicated = resolution.allResolved;
+
+      const groupingVersion = symbolicated
+        ? GROUPING_VERSION_SYMBOLICATED
+        : GROUPING_VERSION_RAW;
+
+      const fingerprint = symbolicated
+        ? computeSymbolicatedFingerprint({
+            type: claimed.type,
+            message: claimed.message,
+            frames: resolution.frames,
+          })
+        : computeFingerprint({
+            type: claimed.type,
+            message: claimed.message,
+            stack: claimed.stack,
+          });
+
+      const culprit = symbolicated
+        ? buildSymbolicatedCulprit(resolution.frames)
+        : buildCulprit(frames);
+
+      // 落库的 frames：符号化成功存还原结果（看板要展示源码位置 + 上下文），
+      // 否则存原始压缩帧 —— 两种形状靠 grouping_version 区分，读侧据此渲染
+      const framesToStore = symbolicated ? resolution.frames : frames;
 
       const group = await tx.errorGroup.upsert({
         where: {
           // 复合唯一约束的输入名 = 字段名用 _ 连接（MVP 去掉了 project_id）
           groupingVersion_fingerprint: {
-            groupingVersion: GROUPING_VERSION,
+            groupingVersion,
             fingerprint,
           },
         },
         create: {
-          groupingVersion: GROUPING_VERSION,
+          groupingVersion,
           fingerprint,
           title: buildTitle(claimed.type, claimed.message),
-          culprit: buildCulprit(frames),
+          culprit,
           firstSeen: claimed.timestamp,
           lastSeen: claimed.timestamp,
           timesSeen: 1,
+          // 版本与 firstSeen 同一个套路：首次出现时一次写定，之后不动
+          firstRelease: claimed.release,
+          lastRelease: claimed.release,
         },
         update: {
-          // firstSeen 有意不更新 —— 见类注释里的"有意留空"
+          // firstSeen / firstRelease 有意不更新 —— 见类注释
           lastSeen: claimed.timestamp,
+          // release 为空的事件**不能**把已有版本覆盖成 NULL：
+          // 未配置版本的页面会和带版本的事件归到同一个问题里，
+          // 直接写 lastRelease: null 会把好不容易记下的版本抹掉
+          ...(claimed.release !== null ? { lastRelease: claimed.release } : {}),
           // 必须用原子 increment，不能写成 timesSeen + 1：
           // 两个并发 Worker 各自读改写会互相覆盖，实际发生 2 次却只加 1
           timesSeen: { increment: 1 },
@@ -186,7 +251,9 @@ export class ErrorEventProcessor extends WorkerHost {
           where: { id: group.id },
           data: { status: 'unresolved', resolvedAt: null },
         });
-        this.logger.log(`问题回归: id=${group.id} resolved → unresolved（收到新事件）`);
+        this.logger.log(
+          `问题回归: id=${group.id} resolved → unresolved（收到新事件）`,
+        );
       }
 
       await tx.errorEvent.update({
@@ -196,14 +263,23 @@ export class ErrorEventProcessor extends WorkerHost {
           // Json? 列不能直接写 null（同 breadcrumbs 的既有写法，见
           // error-events.service.ts 的 toRow）：没有 frames 时字段整个不出现，
           // 列保持 SQL NULL，语义最干净
-          ...(frames.length > 0
-            ? { stacktraceFrames: frames as unknown as Prisma.InputJsonValue }
+          ...(framesToStore.length > 0
+            ? {
+                stacktraceFrames:
+                  framesToStore as unknown as Prisma.InputJsonValue,
+              }
             : {}),
         },
       });
       // ───────────────────────────────────────────────────────────────
 
-      return { event: claimed, fingerprint, groupId: group.id, timesSeen: group.timesSeen };
+      return {
+        event: claimed,
+        fingerprint,
+        groupId: group.id,
+        timesSeen: group.timesSeen,
+        symbolicated,
+      };
     });
   }
 
@@ -226,7 +302,10 @@ export class ErrorEventProcessor extends WorkerHost {
 
   /** 每一次尝试失败都会触发（含还有重试次数的那几次） */
   @OnWorkerEvent('failed')
-  async onFailed(job: Job<ErrorEventJobData> | undefined, err: Error): Promise<void> {
+  async onFailed(
+    job: Job<ErrorEventJobData> | undefined,
+    err: Error,
+  ): Promise<void> {
     // job 为 undefined 是 BullMQ 的类型约定：反序列化都失败时拿不到 job 对象
     if (job === undefined) {
       this.logger.error(`任务失败且拿不到 job 详情: ${err.message}`);
