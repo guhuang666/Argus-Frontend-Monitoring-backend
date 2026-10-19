@@ -33,8 +33,9 @@ export class IssuesService {
    * 就是为它建的，换字段就是全表 sort。
    */
   async listIssues(query: ListIssuesQueryDto) {
-    const { page, pageSize, status } = query;
-    const where = status === undefined ? {} : { status };
+    const { page, pageSize, status, projectId } = query;
+    // TC-08：projectId 永远在 where 里（M4-S2 起来自查询参数，S4 起由 JWT 决定）
+    const where = status === undefined ? { projectId } : { projectId, status };
 
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.errorGroup.findMany({
@@ -56,18 +57,20 @@ export class IssuesService {
    * 事件用分页而不是全量：一个热门问题可能有几十万条明细，
    * 详情页首屏只需要最新的一页（FR-8.9「原始事件列表」同此口径）。
    */
-  async getIssue(id: string, query: PageQueryDto) {
+  async getIssue(id: string, projectId: string, query: PageQueryDto) {
     const { page, pageSize } = query;
 
-    const group = await this.prisma.errorGroup.findUnique({
-      where: { id },
+    // 用 findFirst 而不是 findUnique：要按 (id, projectId) 双重定位，
+    // 别人的项目 id 在这里查不到 → 走"问题不存在"，不泄露"存在但无权"
+    const group = await this.prisma.errorGroup.findFirst({
+      where: { id, projectId },
       include: { _count: { select: { events: true } } },
     });
     if (group === null) {
       throw new NotFoundException(`问题不存在: ${id}`);
     }
 
-    const where = { groupId: id };
+    const where = { groupId: id, projectId };
     const [events, total] = await this.prisma.$transaction([
       this.prisma.errorEvent.findMany({
         where,
@@ -91,9 +94,10 @@ export class IssuesService {
    * 「NULL 表示尚未解决」的语义一致。所以不能无脑每次 update：
    * 对同一个状态重复调用是幂等的，不会反复刷新时间。
    */
-  async updateStatus(id: string, dto: UpdateIssueStatusDto) {
-    const group = await this.prisma.errorGroup.findUnique({
-      where: { id },
+  async updateStatus(id: string, projectId: string, dto: UpdateIssueStatusDto) {
+    // 同 getIssue：先按 (id, projectId) 确认归属，再更新
+    const group = await this.prisma.errorGroup.findFirst({
+      where: { id, projectId },
       include: { _count: { select: { events: true } } },
     });
     if (group === null) {

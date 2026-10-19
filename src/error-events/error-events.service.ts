@@ -70,11 +70,11 @@ export class ErrorEventsService {
    * "事务"只会在其中一边挂着时留下更难查的状态）。代价是"入库成功但入队失败"，
    * 由补扫任务兜住。
    */
-  async ingest(payload: IngestErrorDto): Promise<IngestResult> {
+  async ingest(payload: IngestErrorDto, projectId: string): Promise<IngestResult> {
     this.logIncoming(payload);
 
     try {
-      await this.prisma.errorEvent.create({ data: this.toRow(payload) });
+      await this.prisma.errorEvent.create({ data: this.toRow(payload, projectId) });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError) {
         // event_id 就是主键，所以撞唯一约束只可能是"这条事件重复上报"
@@ -138,9 +138,11 @@ export class ErrorEventsService {
    * 缺值统一落 null 而不是 ''：列可空，"SDK 没发这个字段"和"发了个空串"是两件事，
    * 用空串兜底会把后者的信息也抹掉。
    */
-  private toRow(payload: IngestErrorDto): Prisma.ErrorEventCreateInput {
+  private toRow(payload: IngestErrorDto, projectId: string): Prisma.ErrorEventUncheckedCreateInput {
     return {
       eventId: payload.event_id,
+      // 所属项目：由控制器从上报公钥反查得到，客户端无从指定（TC-05）
+      projectId,
       // DTO 的取值联合与 schema 的 Mechanism enum 一一对应（onerror / unhandledrejection / resource），
       // 所以这里直接赋，不需要转换或做映射表
       mechanism: payload.mechanism,
@@ -200,17 +202,19 @@ export class ErrorEventsService {
    *   ② 列表与总数放进同一个 $transaction —— 同一事务快照，并发写入时不会
    *      出现"total=10 但翻到第 2 页是空的"这种自相矛盾
    *
-   * 过渡接口：暂无 projectId 过滤（表里还没有 project_id 列）。
+   * 过渡接口：M4-S2 起 projectId 必填（来自查询参数，S4 后改由 JWT 决定）。
    * 另注：count() 在几十万行时是全表扫描，M2 之后趋势类查询改读预聚合表。
    */
-  async listErrorEvents(page: number, pageSize: number) {
+  async listErrorEvents(projectId: string, page: number, pageSize: number) {
+    const where = { projectId };
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.errorEvent.findMany({
+        where,
         orderBy: { timestamp: 'desc' },
         skip: (page - 1) * pageSize,
         take: pageSize,
       }),
-      this.prisma.errorEvent.count(),
+      this.prisma.errorEvent.count({ where }),
     ]);
 
     return {

@@ -14,6 +14,8 @@
     "dev": "nest build && concurrently -k -n build,api,worker -c gray,cyan,magenta \"nest build --watch\" \"node --watch dist/src/main.js\" \"node --watch dist/src/worker.js\"",
     "dev:api": "node --watch dist/src/main.js",
     "dev:worker": "node --watch dist/src/worker.js",
+    "seed": "npm run build && node --env-file=.env scripts/seed.cjs",
+    "project:new": "npm run build && node --env-file=.env scripts/project-new.cjs",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/src/main",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",

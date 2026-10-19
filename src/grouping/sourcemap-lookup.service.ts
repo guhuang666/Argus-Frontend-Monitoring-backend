@@ -57,6 +57,7 @@ export class SourcemapLookupService {
    */
   async symbolicate(
     db: Prisma.TransactionClient,
+    projectId: string,
     release: string | null,
     frames: Frame[],
   ): Promise<SymbolicationResult> {
@@ -65,7 +66,7 @@ export class SourcemapLookupService {
       return symbolicateFrames(frames, () => null);
     }
 
-    const byArtifact = await this.mapsFor(db, release);
+    const byArtifact = await this.mapsFor(db, projectId, release);
     if (byArtifact.size === 0) {
       return symbolicateFrames(frames, () => null);
     }
@@ -76,12 +77,16 @@ export class SourcemapLookupService {
     });
   }
 
-  /** release → (artifact_path → sourcemap_path)。带 TTL 缓存，空结果也缓存 */
+  /** (project, release) → (artifact_path → sourcemap_path)。带 TTL 缓存，空结果也缓存 */
   private async mapsFor(
     db: Prisma.TransactionClient,
+    projectId: string,
     release: string,
   ): Promise<Map<string, string>> {
-    const hit = this.releaseCache.get(release);
+    // 缓存键必须带 projectId：release 的唯一性从 version 收窄成了
+    // (project_id, version)，两个项目完全可以用同一个版本号
+    const cacheKey = `${projectId}:${release}`;
+    const hit = this.releaseCache.get(cacheKey);
     if (hit !== undefined && hit.expiresAt > Date.now()) {
       return hit.byArtifact;
     }
@@ -90,7 +95,7 @@ export class SourcemapLookupService {
 
     try {
       const row = await db.release.findUnique({
-        where: { version: release },
+        where: { projectId_version: { projectId, version: release } },
         select: { id: true },
       });
 

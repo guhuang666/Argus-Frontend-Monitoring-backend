@@ -1,0 +1,112 @@
+df5f20563b33c92f63c660e53cb62aaf
+"use strict";
+/**
+ * 消息归一化 —— 指纹算法的第一道工序（M2 / 对应 SRS FR-4.2）。
+ *
+ * 目的：把「每次都变」的片段（UUID、URL、十六进制串、长数字、字符串字面量）
+ * 换成固定占位符，让同一个 bug 的多次发生归一化成**同一个字符串**，
+ * 进而算出同一个指纹、归并成同一个问题。
+ *
+ * ── 三条纪律 ────────────────────────────────────────────────────────────
+ * ① 入参必须是**原始** message。归一化只发生在「算指纹」这一步，绝不能把结果
+ *    回写覆盖 error_events.message —— TC-10 要求指纹的输入能从原始载荷无损重建。
+ * ② 规则顺序即优先级，不能重排。顺序错了有两类后果：
+ *      · 大颗粒没先替换 → 被小颗粒切碎（UUID 会先被数字规则切成
+ *        <number>e<number>-<number>…，UUID 规则再也匹配不上）
+ *      · 占位符被后续规则二次替换（本表所有占位符都不含数字/URL/引号，天然免疫）
+ * ③ 纯函数：同输入必同输出。不许出现时间、随机数、环境相关的分支 ——
+ *    指纹抖一次，看板上就多一个假问题。
+ *
+ * ── 与 SDK 的耦合点（改 SDK 消息格式必须同步这里）───────────────────────
+ * 资源通道（resource）**没有堆栈**，SDK 发的 stack 是空串，指纹只能靠 type + message。
+ * 而 message 里带着失败的资源 URL，每张图都不同 —— 不归一化就是
+ * 「1000 条上报 → 几百个问题」。格式见 sdk/index.ts 的 buildResource()：
+ *
+ *     资源加载失败 <img> https://cdn.example.com/assets/hero-1.png?1791881743485
+ *     ↓ 归一化
+ *     资源加载失败 <img> <asset>
+ *
+ * 注意 type 字段本身是标签名（img / script / link），所以「图片加载失败」和
+ * 「脚本加载失败」仍然分属两个问题 —— 这是有意的，两者根因和修法完全不同。
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.RULES = void 0;
+exports.normalizeMessage = normalizeMessage;
+/**
+ * 归一化规则表：**数组顺序就是执行顺序**，改动前先读文件头的「三条纪律」。
+ */
+exports.RULES = [
+    // ① UUID —— 必须最先。
+    //    一个 UUID 里同时有十六进制段和数字段，先跑 hex/number 规则会把它切碎。
+    {
+        name: 'uuid',
+        pattern: /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+        to: '<uuid>',
+    },
+    // ② 资源通道的 URL —— 必须排在通用 URL 规则**前面**，否则先被吃掉变成 <url>，
+    //    「资源加载失败 → <asset>」这条语义就丢了。
+    //    用后行断言锚住 SDK 的消息形状：好处是函数保持纯粹（不需要知道 mechanism）；
+    //    代价是 SDK 一旦改消息格式，这条正则要跟着改（已在上方「耦合点」标注）。
+    //    \s{0,4} 是给「标签和 URL 之间可能有空格」留的余量；没有 URL 时不匹配，原样保留。
+    {
+        name: 'asset',
+        pattern: /(?<=资源加载失败\s{0,4}<[a-z]+>\s{0,4})\S+/g,
+        to: '<asset>',
+    },
+    // ③ 绝对 URL（含 query 和 fragment）—— 必须排在 hex/number 前，
+    //    否则 URL 里的十六进制段和数字会先被替换，整条路径就认不出来了
+    {
+        name: 'url-absolute',
+        pattern: /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)]+/gi,
+        to: '<url>',
+    },
+    // ④ 相对路径 —— SRS §5.4 的例子 `Timeout after 3000ms at /api/a?t=17` 就是这种。
+    //    $1 把前面的分隔符原样还回去（不然会吃掉一个空格，把词粘在一起）。
+    //    已知简化：只认「行首 / 空白 / 括号引号等号」开头的路径；紧跟中文的路径不匹配。
+    {
+        name: 'url-relative',
+        pattern: /(^|[\s("'=])\/[^\s"'<>)]+/g,
+        to: '$1<url>',
+    },
+    // ⑤ 十六进制串（≥8 位）—— 必须排在 number 前，否则 a1b2c3d4 会被切成 a<number>b<number>…
+    //    注意：纯数字的长串也是合法十六进制，所以 13 位时间戳会落到这里变成 <hex>。
+    //    对归并没有影响（同样稳定），只是名字看着奇怪；想让它归 <number>，
+    //    在 {8,} 前面加一个 (?=[0-9a-f]*[a-f]) 即可（要求至少含一个字母）
+    {
+        name: 'hex',
+        pattern: /(?<![0-9a-z])[0-9a-f]{8,}(?![0-9a-z])/gi,
+        to: '<hex>',
+    },
+    // ⑥ 长数字（≥4 位）—— 门槛取 4 而不是 1，因为 1~3 位数（版本号、端口、短 ID）
+    //    在正常文本里太常见，一律替换会把消息糊成一片，反而降级归并质量。
+    //    用否定环视做边界而不用 \b：\b 是 ASCII 词边界，中文（`用户10231`）旁边行为反直觉。
+    //    只做**前**边界、不做后边界：单位后缀紧跟数字是合法写法（`3000ms` / `200px`），
+    //    加了后视会把它们整条挡掉，SRS 的 `Timeout after 3000ms` 用例就过不了；
+    //    而「别匹配半个数字」这件事由 {4,} 的贪婪匹配自己保证（12345 会整体吃掉）
+    {
+        name: 'number',
+        pattern: /(?<![0-9a-z])[0-9]{4,}/g,
+        to: '<number>',
+    },
+    // ⑦ 引号包裹的内容（字符串字面量）—— 放最后：里面的 URL / 数字已经被前面的规则
+    //    处理过，反正整段都会被吞掉，顺序只影响中间态，不影响最终结果
+    {
+        name: 'string',
+        pattern: /"[^"]*"|'[^']*'/g,
+        to: '<string>',
+    },
+];
+/**
+ * 归一化一条消息。
+ *
+ * @param raw 原始 message（**不要**传已经归一化过的值，见文件头纪律 ①）
+ * @returns 归一化后的字符串；null / undefined 视为空串
+ */
+function normalizeMessage(raw) {
+    let out = typeof raw === 'string' ? raw : '';
+    for (const rule of exports.RULES) {
+        out = out.replace(rule.pattern, rule.to);
+    }
+    return out;
+}
+//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJmaWxlIjoiRTpcXEFyZ3VzXFxiYWNrZW5kXFxzcmNcXGdyb3VwaW5nXFxub3JtYWxpemUudHMiLCJtYXBwaW5ncyI6IjtBQUFBOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7O0dBNEJHOzs7QUF1RkgsNENBTUM7QUE3RUQ7O0dBRUc7QUFDVSxRQUFBLEtBQUssR0FBNkI7SUFDN0Msa0JBQWtCO0lBQ2xCLGtEQUFrRDtJQUNsRDtRQUNFLElBQUksRUFBRSxNQUFNO1FBQ1osT0FBTyxFQUFFLGdFQUFnRTtRQUN6RSxFQUFFLEVBQUUsUUFBUTtLQUNiO0lBQ0QscURBQXFEO0lBQ3JELGdDQUFnQztJQUNoQyxtREFBbUQ7SUFDbkQsNENBQTRDO0lBQzVDLHVEQUF1RDtJQUN2RDtRQUNFLElBQUksRUFBRSxPQUFPO1FBQ2IsT0FBTyxFQUFFLHVDQUF1QztRQUNoRCxFQUFFLEVBQUUsU0FBUztLQUNkO0lBQ0Qsb0RBQW9EO0lBQ3BELHVDQUF1QztJQUN2QztRQUNFLElBQUksRUFBRSxjQUFjO1FBQ3BCLE9BQU8sRUFBRSxxQ0FBcUM7UUFDOUMsRUFBRSxFQUFFLE9BQU87S0FDWjtJQUNELHFFQUFxRTtJQUNyRSx3Q0FBd0M7SUFDeEMsZ0RBQWdEO0lBQ2hEO1FBQ0UsSUFBSSxFQUFFLGNBQWM7UUFDcEIsT0FBTyxFQUFFLDRCQUE0QjtRQUNyQyxFQUFFLEVBQUUsU0FBUztLQUNkO0lBQ0QscUVBQXFFO0lBQ3JFLGdEQUFnRDtJQUNoRCwyQ0FBMkM7SUFDM0MsbURBQW1EO0lBQ25EO1FBQ0UsSUFBSSxFQUFFLEtBQUs7UUFDWCxPQUFPLEVBQUUseUNBQXlDO1FBQ2xELEVBQUUsRUFBRSxPQUFPO0tBQ1o7SUFDRCxtREFBbUQ7SUFDbkQsc0NBQXNDO0lBQ3RDLHlEQUF5RDtJQUN6RCx3REFBd0Q7SUFDeEQsdURBQXVEO0lBQ3ZELGdEQUFnRDtJQUNoRDtRQUNFLElBQUksRUFBRSxRQUFRO1FBQ2QsT0FBTyxFQUFFLHlCQUF5QjtRQUNsQyxFQUFFLEVBQUUsVUFBVTtLQUNmO0lBQ0QsK0NBQStDO0lBQy9DLG9DQUFvQztJQUNwQztRQUNFLElBQUksRUFBRSxRQUFRO1FBQ2QsT0FBTyxFQUFFLGtCQUFrQjtRQUMzQixFQUFFLEVBQUUsVUFBVTtLQUNmO0NBQ0YsQ0FBQztBQUVGOzs7OztHQUtHO0FBQ0gsU0FBZ0IsZ0JBQWdCLENBQUMsR0FBOEI7SUFDN0QsSUFBSSxHQUFHLEdBQUcsT0FBTyxHQUFHLEtBQUssUUFBUSxDQUFDLENBQUMsQ0FBQyxHQUFHLENBQUMsQ0FBQyxDQUFDLEVBQUUsQ0FBQztJQUM3QyxLQUFLLE1BQU0sSUFBSSxJQUFJLGFBQUssRUFBRSxDQUFDO1FBQ3pCLEdBQUcsR0FBRyxHQUFHLENBQUMsT0FBTyxDQUFDLElBQUksQ0FBQyxPQUFPLEVBQUUsSUFBSSxDQUFDLEVBQUUsQ0FBQyxDQUFDO0lBQzNDLENBQUM7SUFDRCxPQUFPLEdBQUcsQ0FBQztBQUNiLENBQUMiLCJuYW1lcyI6W10sInNvdXJjZXMiOlsiRTpcXEFyZ3VzXFxiYWNrZW5kXFxzcmNcXGdyb3VwaW5nXFxub3JtYWxpemUudHMiXSwic291cmNlc0NvbnRlbnQiOlsiLyoqXG4gKiDmtojmga/lvZLkuIDljJYg4oCU4oCUIOaMh+e6ueeul+azleeahOesrOS4gOmBk+W3peW6j++8iE0yIC8g5a+55bqUIFNSUyBGUi00LjLvvInjgIJcbiAqXG4gKiDnm67nmoTvvJrmiorjgIzmr4/mrKHpg73lj5jjgI3nmoTniYfmrrXvvIhVVUlE44CBVVJM44CB5Y2B5YWt6L+b5Yi25Liy44CB6ZW/5pWw5a2X44CB5a2X56ym5Liy5a2X6Z2i6YeP77yJXG4gKiDmjaLmiJDlm7rlrprljaDkvY3nrKbvvIzorqnlkIzkuIDkuKogYnVnIOeahOWkmuasoeWPkeeUn+W9kuS4gOWMluaIkCoq5ZCM5LiA5Liq5a2X56ym5LiyKirvvIxcbiAqIOi/m+iAjOeul+WHuuWQjOS4gOS4quaMh+e6ueOAgeW9kuW5tuaIkOWQjOS4gOS4qumXrumimOOAglxuICpcbiAqIOKUgOKUgCDkuInmnaHnuqrlvosg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4gKiDikaAg5YWl5Y+C5b+F6aG75pivKirljp/lp4sqKiBtZXNzYWdl44CC5b2S5LiA5YyW5Y+q5Y+R55Sf5Zyo44CM566X5oyH57q544CN6L+Z5LiA5q2l77yM57ud5LiN6IO95oqK57uT5p6cXG4gKiAgICDlm57lhpnopobnm5YgZXJyb3JfZXZlbnRzLm1lc3NhZ2Ug4oCU4oCUIFRDLTEwIOimgeaxguaMh+e6ueeahOi+k+WFpeiDveS7juWOn+Wni+i9veiNt+aXoOaNn+mHjeW7uuOAglxuICog4pGhIOinhOWImemhuuW6j+WNs+S8mOWFiOe6p++8jOS4jeiDvemHjeaOkuOAgumhuuW6j+mUmeS6huacieS4pOexu+WQjuaenO+8mlxuICogICAgICDCtyDlpKfpopfnspLmsqHlhYjmm7/mjaIg4oaSIOiiq+Wwj+mil+eykuWIh+eiju+8iFVVSUQg5Lya5YWI6KKr5pWw5a2X6KeE5YiZ5YiH5oiQXG4gKiAgICAgICAgPG51bWJlcj5lPG51bWJlcj4tPG51bWJlcj7igKbvvIxVVUlEIOinhOWImeWGjeS5n+WMuemFjeS4jeS4iu+8iVxuICogICAgICDCtyDljaDkvY3nrKbooqvlkI7nu63op4TliJnkuozmrKHmm7/mjaLvvIjmnKzooajmiYDmnInljaDkvY3nrKbpg73kuI3lkKvmlbDlrZcvVVJML+W8leWPt++8jOWkqeeEtuWFjeeWq++8iVxuICog4pGiIOe6r+WHveaVsO+8muWQjOi+k+WFpeW/heWQjOi+k+WHuuOAguS4jeiuuOWHuueOsOaXtumXtOOAgemaj+acuuaVsOOAgeeOr+Wig+ebuOWFs+eahOWIhuaUryDigJTigJRcbiAqICAgIOaMh+e6ueaKluS4gOasoe+8jOeci+adv+S4iuWwseWkmuS4gOS4quWBh+mXrumimOOAglxuICpcbiAqIOKUgOKUgCDkuI4gU0RLIOeahOiApuWQiOeCue+8iOaUuSBTREsg5raI5oGv5qC85byP5b+F6aG75ZCM5q2l6L+Z6YeM77yJ4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4gKiDotYTmupDpgJrpgZPvvIhyZXNvdXJjZe+8iSoq5rKh5pyJ5aCG5qCIKirvvIxTREsg5Y+R55qEIHN0YWNrIOaYr+epuuS4su+8jOaMh+e6ueWPquiDvemdoCB0eXBlICsgbWVzc2FnZeOAglxuICog6ICMIG1lc3NhZ2Ug6YeM5bim552A5aSx6LSl55qE6LWE5rqQIFVSTO+8jOavj+W8oOWbvumDveS4jeWQjCDigJTigJQg5LiN5b2S5LiA5YyW5bCx5pivXG4gKiDjgIwxMDAwIOadoeS4iuaKpSDihpIg5Yeg55m+5Liq6Zeu6aKY44CN44CC5qC85byP6KeBIHNkay9pbmRleC50cyDnmoQgYnVpbGRSZXNvdXJjZSgp77yaXG4gKlxuICogICAgIOi1hOa6kOWKoOi9veWksei0pSA8aW1nPiBodHRwczovL2Nkbi5leGFtcGxlLmNvbS9hc3NldHMvaGVyby0xLnBuZz8xNzkxODgxNzQzNDg1XG4gKiAgICAg4oaTIOW9kuS4gOWMllxuICogICAgIOi1hOa6kOWKoOi9veWksei0pSA8aW1nPiA8YXNzZXQ+XG4gKlxuICog5rOo5oSPIHR5cGUg5a2X5q615pys6Lqr5piv5qCH562+5ZCN77yIaW1nIC8gc2NyaXB0IC8gbGlua++8ie+8jOaJgOS7peOAjOWbvueJh+WKoOi9veWksei0peOAjeWSjFxuICog44CM6ISa5pys5Yqg6L295aSx6LSl44CN5LuN54S25YiG5bGe5Lik5Liq6Zeu6aKYIOKAlOKAlCDov5nmmK/mnInmhI/nmoTvvIzkuKTogIXmoLnlm6Dlkozkv67ms5XlrozlhajkuI3lkIzjgIJcbiAqL1xuXG4vKiog5LiA5p2h5b2S5LiA5YyW6KeE5YiZ44CCcGF0dGVybiDlj6rnlKjkuo4gcmVwbGFjZe+8jOS4jeimgeaLv+WOuyB0ZXN0L2V4ZWPjgIIgKi9cbmludGVyZmFjZSBOb3JtYWxpemVSdWxlIHtcbiAgLyoqIOinhOWImeWQjeOAgua1i+ivleWksei0peaXtueUqOWug+WumuS9jeaYr+WTquadoeinhOWImeWSrOWIsOS6hiAqL1xuICByZWFkb25seSBuYW1lOiBzdHJpbmc7XG4gIC8qKlxuICAgKiDljLnphY3mqKHlvI/jgILlv4XpobvluKYgZyDmoIflv5fvvIjopoHmm7/mjaLlhajpg6jlh7rnjrDvvInjgIJcbiAgICog5o+Q56S677ya5bimIGcg55qE5q2j5YiZ5a+56LGh5pyJIGxhc3RJbmRleCDnirbmgIHvvIznlKggdGVzdCgpL2V4ZWMoKSDlpI3nlKjkvJrouKnlnZHvvJtcbiAgICog5pys5paH5Lu25Y+q55SoIHJlcGxhY2UoKe+8jOWug+avj+asoemDveS8mumHjee9ru+8jOWuieWFqOOAglxuICAgKi9cbiAgcmVhZG9ubHkgcGF0dGVybjogUmVnRXhwO1xuICAvKiog5pu/5o2i5oiQ55qE5Y2g5L2N56ym77yb6ZyA6KaB5L+d55WZ5o2V6I6357uE5pe255SoICQxICovXG4gIHJlYWRvbmx5IHRvOiBzdHJpbmc7XG59XG5cbi8qKlxuICog5b2S5LiA5YyW6KeE5YiZ6KGo77yaKirmlbDnu4Tpobrluo/lsLHmmK/miafooYzpobrluo8qKu+8jOaUueWKqOWJjeWFiOivu+aWh+S7tuWktOeahOOAjOS4ieadoee6quW+i+OAjeOAglxuICovXG5leHBvcnQgY29uc3QgUlVMRVM6IHJlYWRvbmx5IE5vcm1hbGl6ZVJ1bGVbXSA9IFtcbiAgLy8g4pGgIFVVSUQg4oCU4oCUIOW/hemhu+acgOWFiOOAglxuICAvLyAgICDkuIDkuKogVVVJRCDph4zlkIzml7bmnInljYHlha3ov5vliLbmrrXlkozmlbDlrZfmrrXvvIzlhYjot5EgaGV4L251bWJlciDop4TliJnkvJrmiorlroPliIfnoo7jgIJcbiAge1xuICAgIG5hbWU6ICd1dWlkJyxcbiAgICBwYXR0ZXJuOiAvWzAtOWEtZl17OH0tWzAtOWEtZl17NH0tWzAtOWEtZl17NH0tWzAtOWEtZl17NH0tWzAtOWEtZl17MTJ9L2dpLFxuICAgIHRvOiAnPHV1aWQ+JyxcbiAgfSxcbiAgLy8g4pGhIOi1hOa6kOmAmumBk+eahCBVUkwg4oCU4oCUIOW/hemhu+aOkuWcqOmAmueUqCBVUkwg6KeE5YiZKirliY3pnaIqKu+8jOWQpuWImeWFiOiiq+WQg+aOieWPmOaIkCA8dXJsPu+8jFxuICAvLyAgICDjgIzotYTmupDliqDovb3lpLHotKUg4oaSIDxhc3NldD7jgI3ov5nmnaHor63kuYnlsLHkuKLkuobjgIJcbiAgLy8gICAg55So5ZCO6KGM5pat6KiA6ZSa5L2PIFNESyDnmoTmtojmga/lvaLnirbvvJrlpb3lpITmmK/lh73mlbDkv53mjIHnuq/nsrnvvIjkuI3pnIDopoHnn6XpgZMgbWVjaGFuaXNt77yJ77ybXG4gIC8vICAgIOS7o+S7t+aYryBTREsg5LiA5pem5pS55raI5oGv5qC85byP77yM6L+Z5p2h5q2j5YiZ6KaB6Lef552A5pS577yI5bey5Zyo5LiK5pa544CM6ICm5ZCI54K544CN5qCH5rOo77yJ44CCXG4gIC8vICAgIFxcc3swLDR9IOaYr+e7meOAjOagh+etvuWSjCBVUkwg5LmL6Ze05Y+v6IO95pyJ56m65qC844CN55WZ55qE5L2Z6YeP77yb5rKh5pyJIFVSTCDml7bkuI3ljLnphY3vvIzljp/moLfkv53nlZnjgIJcbiAge1xuICAgIG5hbWU6ICdhc3NldCcsXG4gICAgcGF0dGVybjogLyg/PD3otYTmupDliqDovb3lpLHotKVcXHN7MCw0fTxbYS16XSs+XFxzezAsNH0pXFxTKy9nLFxuICAgIHRvOiAnPGFzc2V0PicsXG4gIH0sXG4gIC8vIOKRoiDnu53lr7kgVVJM77yI5ZCrIHF1ZXJ5IOWSjCBmcmFnbWVudO+8ieKAlOKAlCDlv4XpobvmjpLlnKggaGV4L251bWJlciDliY3vvIxcbiAgLy8gICAg5ZCm5YiZIFVSTCDph4znmoTljYHlha3ov5vliLbmrrXlkozmlbDlrZfkvJrlhYjooqvmm7/mjaLvvIzmlbTmnaHot6/lvoTlsLHorqTkuI3lh7rmnaXkuoZcbiAge1xuICAgIG5hbWU6ICd1cmwtYWJzb2x1dGUnLFxuICAgIHBhdHRlcm46IC9bYS16XVthLXowLTkrLi1dKjpcXC9cXC9bXlxcc1wiJzw+KV0rL2dpLFxuICAgIHRvOiAnPHVybD4nLFxuICB9LFxuICAvLyDikaMg55u45a+56Lev5b6EIOKAlOKAlCBTUlMgwqc1LjQg55qE5L6L5a2QIGBUaW1lb3V0IGFmdGVyIDMwMDBtcyBhdCAvYXBpL2E/dD0xN2Ag5bCx5piv6L+Z56eN44CCXG4gIC8vICAgICQxIOaKiuWJjemdoueahOWIhumalOespuWOn+agt+i/mOWbnuWOu++8iOS4jeeEtuS8muWQg+aOieS4gOS4quepuuagvO+8jOaKiuivjeeymOWcqOS4gOi1t++8ieOAglxuICAvLyAgICDlt7Lnn6XnroDljJbvvJrlj6rorqTjgIzooYzpppYgLyDnqbrnmb0gLyDmi6zlj7flvJXlj7fnrYnlj7fjgI3lvIDlpLTnmoTot6/lvoTvvJvntKfot5/kuK3mlofnmoTot6/lvoTkuI3ljLnphY3jgIJcbiAge1xuICAgIG5hbWU6ICd1cmwtcmVsYXRpdmUnLFxuICAgIHBhdHRlcm46IC8oXnxbXFxzKFwiJz1dKVxcL1teXFxzXCInPD4pXSsvZyxcbiAgICB0bzogJyQxPHVybD4nLFxuICB9LFxuICAvLyDikaQg5Y2B5YWt6L+b5Yi25Liy77yI4omlOCDkvY3vvInigJTigJQg5b+F6aG75o6S5ZyoIG51bWJlciDliY3vvIzlkKbliJkgYTFiMmMzZDQg5Lya6KKr5YiH5oiQIGE8bnVtYmVyPmI8bnVtYmVyPuKAplxuICAvLyAgICDms6jmhI/vvJrnuq/mlbDlrZfnmoTplb/kuLLkuZ/mmK/lkIjms5XljYHlha3ov5vliLbvvIzmiYDku6UgMTMg5L2N5pe26Ze05oiz5Lya6JC95Yiw6L+Z6YeM5Y+Y5oiQIDxoZXg+44CCXG4gIC8vICAgIOWvueW9kuW5tuayoeacieW9seWTje+8iOWQjOagt+eos+Wumu+8ie+8jOWPquaYr+WQjeWtl+eci+edgOWlh+aAqu+8m+aDs+iuqeWug+W9kiA8bnVtYmVyPu+8jFxuICAvLyAgICDlnKggezgsfSDliY3pnaLliqDkuIDkuKogKD89WzAtOWEtZl0qW2EtZl0pIOWNs+WPr++8iOimgeaxguiHs+WwkeWQq+S4gOS4quWtl+avje+8iVxuICB7XG4gICAgbmFtZTogJ2hleCcsXG4gICAgcGF0dGVybjogLyg/PCFbMC05YS16XSlbMC05YS1mXXs4LH0oPyFbMC05YS16XSkvZ2ksXG4gICAgdG86ICc8aGV4PicsXG4gIH0sXG4gIC8vIOKRpSDplb/mlbDlrZfvvIjiiaU0IOS9je+8ieKAlOKAlCDpl6jmp5vlj5YgNCDogIzkuI3mmK8gMe+8jOWboOS4uiAxfjMg5L2N5pWw77yI54mI5pys5Y+344CB56uv5Y+j44CB55+tIElE77yJXG4gIC8vICAgIOWcqOato+W4uOaWh+acrOmHjOWkquW4uOinge+8jOS4gOW+i+abv+aNouS8muaKiua2iOaBr+eziuaIkOS4gOeJh++8jOWPjeiAjOmZjee6p+W9kuW5tui0qOmHj+OAglxuICAvLyAgICDnlKjlkKblrprnjq/op4blgZrovrnnlYzogIzkuI3nlKggXFxi77yaXFxiIOaYryBBU0NJSSDor43ovrnnlYzvvIzkuK3mlofvvIhg55So5oi3MTAyMzFg77yJ5peB6L656KGM5Li65Y+N55u06KeJ44CCXG4gIC8vICAgIOWPquWBmioq5YmNKirovrnnlYzjgIHkuI3lgZrlkI7ovrnnlYzvvJrljZXkvY3lkI7nvIDntKfot5/mlbDlrZfmmK/lkIjms5Xlhpnms5XvvIhgMzAwMG1zYCAvIGAyMDBweGDvvInvvIxcbiAgLy8gICAg5Yqg5LqG5ZCO6KeG5Lya5oqK5a6D5Lus5pW05p2h5oyh5o6J77yMU1JTIOeahCBgVGltZW91dCBhZnRlciAzMDAwbXNgIOeUqOS+i+Wwsei/h+S4jeS6hu+8m1xuICAvLyAgICDogIzjgIzliKvljLnphY3ljYrkuKrmlbDlrZfjgI3ov5nku7bkuovnlLEgezQsfSDnmoTotKrlqarljLnphY3oh6rlt7Hkv53or4HvvIgxMjM0NSDkvJrmlbTkvZPlkIPmjonvvIlcbiAge1xuICAgIG5hbWU6ICdudW1iZXInLFxuICAgIHBhdHRlcm46IC8oPzwhWzAtOWEtel0pWzAtOV17NCx9L2csXG4gICAgdG86ICc8bnVtYmVyPicsXG4gIH0sXG4gIC8vIOKRpiDlvJXlj7fljIXoo7nnmoTlhoXlrrnvvIjlrZfnrKbkuLLlrZfpnaLph4/vvInigJTigJQg5pS+5pyA5ZCO77ya6YeM6Z2i55qEIFVSTCAvIOaVsOWtl+W3sue7j+iiq+WJjemdoueahOinhOWImVxuICAvLyAgICDlpITnkIbov4fvvIzlj43mraPmlbTmrrXpg73kvJrooqvlkJ7mjonvvIzpobrluo/lj6rlvbHlk43kuK3pl7TmgIHvvIzkuI3lvbHlk43mnIDnu4jnu5PmnpxcbiAge1xuICAgIG5hbWU6ICdzdHJpbmcnLFxuICAgIHBhdHRlcm46IC9cIlteXCJdKlwifCdbXiddKicvZyxcbiAgICB0bzogJzxzdHJpbmc+JyxcbiAgfSxcbl07XG5cbi8qKlxuICog5b2S5LiA5YyW5LiA5p2h5raI5oGv44CCXG4gKlxuICogQHBhcmFtIHJhdyDljp/lp4sgbWVzc2FnZe+8iCoq5LiN6KaBKirkvKDlt7Lnu4/lvZLkuIDljJbov4fnmoTlgLzvvIzop4Hmlofku7blpLTnuqrlvosg4pGg77yJXG4gKiBAcmV0dXJucyDlvZLkuIDljJblkI7nmoTlrZfnrKbkuLLvvJtudWxsIC8gdW5kZWZpbmVkIOinhuS4uuepuuS4slxuICovXG5leHBvcnQgZnVuY3Rpb24gbm9ybWFsaXplTWVzc2FnZShyYXc6IHN0cmluZyB8IG51bGwgfCB1bmRlZmluZWQpOiBzdHJpbmcge1xuICBsZXQgb3V0ID0gdHlwZW9mIHJhdyA9PT0gJ3N0cmluZycgPyByYXcgOiAnJztcbiAgZm9yIChjb25zdCBydWxlIG9mIFJVTEVTKSB7XG4gICAgb3V0ID0gb3V0LnJlcGxhY2UocnVsZS5wYXR0ZXJuLCBydWxlLnRvKTtcbiAgfVxuICByZXR1cm4gb3V0O1xufVxuIl0sInZlcnNpb24iOjN9

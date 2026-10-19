@@ -54,11 +54,11 @@ export class PerformanceService {
    * 为什么不用 upsert：它对重复投递是静默更新，接口就没法再回 duplicate 了。
    * 为什么不用先 findUnique 再 create：两次查询之间有竞态，并发重复上报两个都会走到 create。
    */
-  async ingest(payload: IngestPerfDto): Promise<IngestPerfResult> {
+  async ingest(payload: IngestPerfDto, projectId: string): Promise<IngestPerfResult> {
     this.logIncoming(payload);
 
     try {
-      await this.prisma.performanceMetric.create({ data: this.toRow(payload) });
+      await this.prisma.performanceMetric.create({ data: this.toRow(payload, projectId) });
       return { event_id: payload.event_id, duplicate: false };
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError) {
@@ -91,10 +91,15 @@ export class PerformanceService {
    * 注意 deviceViewport / deviceDpr 不再用 '' 和 0 兜底（旧 Mongoose 代码是那么写的）：
    * 和 lcp/cls/inp 同一条纪律 —— 没测到 ≠ 测得 0，用 0 冒充会让看板分不出这两种情况。
    */
-  private toRow(payload: IngestPerfDto): Prisma.PerformanceMetricCreateInput {
+  private toRow(
+    payload: IngestPerfDto,
+    projectId: string,
+  ): Prisma.PerformanceMetricUncheckedCreateInput {
     const { metrics, attribution, device } = payload;
     return {
       eventId: payload.event_id,
+      // 所属项目：由控制器从上报公钥反查得到，客户端无从指定（TC-05）
+      projectId,
       timestamp: payload.timestamp ? new Date(payload.timestamp) : new Date(),
       url: payload.url ?? '',
       userAgent: payload.user_agent ?? '',
@@ -140,16 +145,18 @@ export class PerformanceService {
    * 读取侧（看板分位数）必须跳过 null 而不是当 0 参与计算，否则"没数据"
    * 会被算成"性能完美"。
    *
-   * 过渡接口：暂无 projectId 过滤（表里还没有 project_id 列）。
+   * 过渡接口：M4-S2 起 projectId 必填（来自查询参数，S4 后改由 JWT 决定）。
    */
-  async listPerformanceMetrics(page: number, pageSize: number) {
+  async listPerformanceMetrics(projectId: string, page: number, pageSize: number) {
+    const where = { projectId };
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.performanceMetric.findMany({
+        where,
         orderBy: { timestamp: 'desc' },
         skip: (page - 1) * pageSize,
         take: pageSize,
       }),
-      this.prisma.performanceMetric.count(),
+      this.prisma.performanceMetric.count({ where }),
     ]);
 
     return {

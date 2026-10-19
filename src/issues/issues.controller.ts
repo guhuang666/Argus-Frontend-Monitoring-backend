@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Query } from '@nestjs/common';
 import { PageQueryDto } from '../common/dto/page-query.dto';
+import { TenantQueryDto } from '../common/dto/tenant-query.dto';
 import { ListIssuesQueryDto } from './dto/list-issues-query.dto';
 import { UpdateIssueStatusDto } from './dto/update-issue-status.dto';
 import { IssuesService } from './issues.service';
@@ -11,10 +12,13 @@ import { IssuesService } from './issues.service';
  * 归并引擎（grouping/）负责把事件聚合成问题；本控制器负责把人需要看的东西
  * 读出来，并允许人改状态。两者不互相 import。
  *
- * ── 路由前缀 ────────────────────────────────────────────────────────────
- * MVP 去掉了 project_id，所以是 `/api/v1/issues`，而不是 SRS §8 的
- * `/projects/:id/issues`。等加回多项目，把 projectId 拼回前缀即可，
- * service 里只多一个 where 字段。
+ * ── 路由前缀：为什么是 ?projectId= 而不是 /projects/:id/issues ────────────
+ * SRS §8 定的是后者。这里先用查询参数，理由有两条：
+ *   ① 与 GET /error、GET /performance 保持一致 —— 三个读接口用同一种方式
+ *      表达"看哪个项目"，看板只需要一处拼接逻辑
+ *   ② S4 上 JWT 之后，"我在看哪个项目"会变成**服务端由身份推导**的事，
+ *      路由前缀里那个 :projectId 反而要额外校验"它确实属于我"
+ * 真正落地多租户路由时，这里一次性改成前缀即可，service 签名不用再动。
  *
  * ── 为什么 id 用 ParseUUIDPipe ──────────────────────────────────────────
  * id 列是 UUID。传个 "abc" 进去，Prisma 会在参数校验阶段抛错 → 变成 500。
@@ -28,7 +32,7 @@ export class IssuesController {
   constructor(private readonly service: IssuesService) {}
 
   /**
-   * GET /api/v1/issues?page=&pageSize=&status=
+   * GET /api/v1/issues?projectId=&page=&pageSize=&status=
    * 问题列表，按最近出现时间倒序。status 可选，不传 = 全部状态。
    */
   @Get()
@@ -37,23 +41,35 @@ export class IssuesController {
   }
 
   /**
-   * GET /api/v1/issues/:id?page=&pageSize=
-   * 问题详情 + 该问题下的事件（分页）。问题不存在 → 404。
+   * GET /api/v1/issues/:id?projectId=&page=&pageSize=
+   * 问题详情 + 该问题下的事件（分页）。
+   *
+   * 问题不存在、或属于别的项目 → **都是 404**（不是 403）。
+   * 403 等于告诉对方"这个 id 确实存在，只是不归你"，那把 id 逐个试一遍
+   * 就能数出别人有几个问题。404 让"不存在"和"无权"不可区分。
    */
   @Get(':id')
-  detail(@Param('id', ParseUUIDPipe) id: string, @Query() query: PageQueryDto) {
-    return this.service.getIssue(id, query);
+  detail(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() tenant: TenantQueryDto,
+    @Query() query: PageQueryDto,
+  ) {
+    return this.service.getIssue(id, tenant.projectId, query);
   }
 
   /**
-   * PATCH /api/v1/issues/:id
+   * PATCH /api/v1/issues/:id?projectId=
    * body: { "status": "resolved" }  —— 取值限 unresolved / resolved / ignored / archived
    *
    * 用 PATCH 而不是 PUT：只改 status 这一个字段，其余字段一个都不动。
    * 返回 { issue, changed }，changed=false 表示状态本来就是这个值（幂等）。
    */
   @Patch(':id')
-  updateStatus(@Param('id', ParseUUIDPipe) id: string, @Body() body: UpdateIssueStatusDto) {
-    return this.service.updateStatus(id, body);
+  updateStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() tenant: TenantQueryDto,
+    @Body() body: UpdateIssueStatusDto,
+  ) {
+    return this.service.updateStatus(id, tenant.projectId, body);
   }
 }

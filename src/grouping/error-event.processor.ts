@@ -56,6 +56,12 @@ interface ClaimedEvent {
    * 表现是看板上永远是"未符号化" —— 所以它必须跟着 RETURNING 回来。
    */
   release: string | null;
+  /**
+   * 所属项目（S0 多租户）。**必须跟着 RETURNING 回来**：upsert error_groups
+   * 的唯一键是 (project_id, grouping_version, fingerprint)，少了它就只能按
+   * 全局归并 —— 两个项目的同名错误会被并成一个问题。
+   */
+  project_id: string;
 }
 
 /** claim() 的产出：声明到的事件 + 归并结果（给日志用） */
@@ -159,7 +165,7 @@ export class ErrorEventProcessor extends WorkerHost {
            SET processed_at = now()
          WHERE event_id = ${eventId}
            AND processed_at IS NULL
-        RETURNING event_id, mechanism, "type", message, stack, timestamp, release
+        RETURNING event_id, mechanism, "type", message, stack, timestamp, release, project_id
       `;
 
       const claimed = rows[0];
@@ -178,6 +184,7 @@ export class ErrorEventProcessor extends WorkerHost {
       // 另开连接会在并发高时把自己卡在连接池上。解析成本靠 service 内的缓存摊薄。
       const resolution = await this.sourcemaps.symbolicate(
         tx,
+        claimed.project_id,
         claimed.release,
         frames,
       );
@@ -209,13 +216,17 @@ export class ErrorEventProcessor extends WorkerHost {
 
       const group = await tx.errorGroup.upsert({
         where: {
-          // 复合唯一约束的输入名 = 字段名用 _ 连接（MVP 去掉了 project_id）
-          groupingVersion_fingerprint: {
+          // 复合唯一约束的输入名 = 字段名用 _ 连接。
+          // S0 起是三元组 (project_id, grouping_version, fingerprint) ——
+          // 少 projectId 就会被当成"全局唯一"，两个项目的同名错误会合并
+          projectId_groupingVersion_fingerprint: {
+            projectId: claimed.project_id,
             groupingVersion,
             fingerprint,
           },
         },
         create: {
+          projectId: claimed.project_id,
           groupingVersion,
           fingerprint,
           title: buildTitle(claimed.type, claimed.message),

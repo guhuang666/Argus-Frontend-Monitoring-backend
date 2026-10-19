@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+﻿import { Logger } from '@nestjs/common';
 import type { Queue } from 'bullmq';
 import { Prisma } from '../../generated/prisma/client';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -50,6 +50,12 @@ import type { IngestErrorDto } from './dto/ingest-error.dto';
  * duplicate 不入队、入队失败不许影响上报结果。
  */
 
+/**
+ * 上报时由鉴权解析出的项目 id。服务层不关心它从哪来，只要求必须带 ——
+ * M4-S2 起 projectId 不再是服务内部算出来的默认值。
+ */
+const PROJECT_ID = '5f0a3d6e-8b1c-4f2a-9d3e-7c6b5a4f3e2d';
+
 /** 最小的事件载荷，字段够过 DTO 形状即可（本测试不走 ValidationPipe） */
 function payload(eventId: string): IngestErrorDto {
   return {
@@ -63,11 +69,14 @@ function payload(eventId: string): IngestErrorDto {
 /** 记录调用顺序的假 Prisma：只实现 ingest 用到的那一个方法 */
 function fakePrisma(behavior: { create: () => Promise<unknown> }) {
   const calls: string[] = [];
+  const created: Array<Record<string, unknown>> = [];
   return {
     calls,
+    created,
     errorEvent: {
-      create: async () => {
+      create: async (args: { data: Record<string, unknown> }) => {
         calls.push('db:create');
+        created.push(args.data);
         return behavior.create();
       },
     },
@@ -118,18 +127,20 @@ describe('ErrorEventsService.ingest 的入队', () => {
     const prisma = fakePrisma({ create: async () => ({}) });
     const queue = fakeQueue();
 
-    const result = await build(prisma, queue).ingest(payload('evt-1'));
+    const result = await build(prisma, queue).ingest(payload('evt-1'), PROJECT_ID);
 
     expect(result).toEqual({ event_id: 'evt-1', duplicate: false });
     expect(prisma.calls).toEqual(['db:create']);
     expect(queue.calls).toEqual(['queue:add']);
+    // 项目归属由调用方传入的那一个决定，不允许服务里出现任何兜底默认值
+    expect(prisma.created[0].projectId).toBe(PROJECT_ID);
   });
 
   it('jobId 就是 event_id，job 名与队列名用契约里的常量', async () => {
     const prisma = fakePrisma({ create: async () => ({}) });
     const queue = fakeQueue();
 
-    await build(prisma, queue).ingest(payload('550e8400-e29b-41d4-a716-446655440000'));
+    await build(prisma, queue).ingest(payload('550e8400-e29b-41d4-a716-446655440000'), PROJECT_ID);
 
     expect(queue.added).toHaveLength(1);
     expect(queue.added[0].name).toBe(ERROR_EVENT_JOB);
@@ -154,7 +165,7 @@ describe('ErrorEventsService.ingest 的入队', () => {
     });
     const queue = fakeQueue();
 
-    const result = await build(prisma, queue).ingest(payload('evt-dup'));
+    const result = await build(prisma, queue).ingest(payload('evt-dup'), PROJECT_ID);
 
     expect(result).toEqual({ event_id: 'evt-dup', duplicate: true });
     expect(queue.calls).toEqual([]);
@@ -168,7 +179,7 @@ describe('ErrorEventsService.ingest 的入队', () => {
       },
     });
 
-    const result = await build(prisma, queue).ingest(payload('evt-2'));
+    const result = await build(prisma, queue).ingest(payload('evt-2'), PROJECT_ID);
 
     expect(result).toEqual({ event_id: 'evt-2', duplicate: false });
     expect(logged.some((line) => line.includes('入队失败') && line.includes('evt-2'))).toBe(true);

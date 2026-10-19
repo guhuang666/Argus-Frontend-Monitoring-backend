@@ -43,7 +43,48 @@ model Project {
 
   organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
+  /// 反向关系（S0 多租户）：四张业务表都以 project_id 归属
+  errorGroups        ErrorGroup[]
+  errorEvents        ErrorEvent[]
+  performanceMetrics PerformanceMetric[]
+  releases           Release[]
+  /// 一个项目可以有多把钥匙（轮换 / 多环境）。见 ProjectKey 的注释
+  keys               ProjectKey[]
+
   @@map("projects")
+}
+
+/// 项目密钥（FR-5.2 / 5.6）
+///
+/// 为什么是独立表而不是 projects 加两列：**一个项目可以同时有多把钥匙**。
+/// 轮换时新 key 先生效、旧 key 标一个未来时间（宽限期），两者并存到旧 key 到期；
+/// 两列的写法只能"覆盖"，一覆盖旧 CI 立刻 401。
+///
+/// 两类钥匙的能力边界（这条是安全模型的核心）：
+///   · publicKey     只授权"往这一个项目写事件"，明文存储（要展示给用户）
+///   · secretKeyHash 授权"管理这一个项目"（上传 Sourcemap、改配置），只存哈希
+model ProjectKey {
+  id String @id @default(uuid()) @db.Uuid
+
+  projectId String  @map("project_id") @db.Uuid
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// 公钥，形如 argus_pub_<32hex>。明文存：要在设置页展示、复制到 SDK
+  publicKey String @unique @map("public_key") @db.VarChar(64)
+
+  /// 私钥的 sha256（hex）。原文只在创建时打印一次，库里永不明文
+  secretKeyHash String @map("secret_key_hash") @db.VarChar(64)
+
+  /// 用途标签，如 production / staging / ci。给人看的，不参与鉴权
+  label String? @db.VarChar(100)
+
+  /// NULL = 有效；有值 = 从该时刻起失效（设成未来时间即宽限期）
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([projectId])
+  @@map("project_keys")
 }
 
 /// 采集通道 —— 对齐 Mongoose 的 enum: ['onerror', 'unhandledrejection', 'resource']
@@ -76,6 +117,14 @@ enum Mechanism {
 /// 而且一句错都不报。
 model ErrorGroup {
   id String @id @default(uuid()) @db.Uuid
+
+  /// 所属项目（S0 多租户）。
+  ///
+  /// **必须 NOT NULL**：Postgres 的唯一索引把 NULL 视为互不相同，一旦可空，
+  /// (project_id, grouping_version, fingerprint) 三元组就形同虚设 —— 同一指纹
+  /// 能插进任意多行 NULL，upsert 永远走 create，一个 bug 炸 1000 次就是 1000 行问题。
+  projectId String  @map("project_id") @db.Uuid
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   /// 指纹哈希
   fingerprint String @db.VarChar(64)
@@ -115,13 +164,12 @@ model ErrorGroup {
   /// 反向关系：归并到本问题下的事件明细
   events ErrorEvent[]
 
-  @@unique([groupingVersion, fingerprint])
-  /// MVP 去掉了 project_id，索引不再以它打头。
-  /// 加回多项目时把 project_id 放回最左 —— TC-08 要求每次查询都带 projectId，
-  /// 索引不以它打头就用不上（SRS §7.1 就是这么定的）。
-  @@index([lastSeen(sort: Desc)])
-  @@index([status, lastSeen(sort: Desc)])
-  @@index([groupingVersion, lastSeen(sort: Desc)])
+  @@unique([projectId, groupingVersion, fingerprint])
+  /// 索引一律以 project_id 打头 —— TC-08 要求每次查询都带 projectId，
+  /// 索引不以它打头就用不上（SRS §7.1 就是这么定的）
+  @@index([projectId, lastSeen(sort: Desc)])
+  @@index([projectId, status, lastSeen(sort: Desc)])
+  @@index([projectId, groupingVersion, lastSeen(sort: Desc)])
   @@map("error_groups")
 }
 
@@ -132,6 +180,10 @@ model ErrorEvent {
   /// SDK 生成的事件唯一 ID，用于重复上报去重。
   /// 用 VarChar 而非 Uuid：DTO 只校验长度（1~128），SDK 发什么形状都收得下
   eventId String @id @map("event_id") @db.VarChar(128)
+
+  /// 所属项目（S0 多租户）。NOT NULL，理由同 ErrorGroup。
+  projectId String  @map("project_id") @db.Uuid
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   /// 采集通道（对应 Mongoose 的 enum 约束）
   mechanism Mechanism
@@ -197,8 +249,8 @@ model ErrorEvent {
   /// 注意：这是**内部字段**，不是给用户看的"已读"标记，不要拿它过滤读接口。
   processedAt DateTime? @map("processed_at") @db.Timestamptz
 
-  /// 看板查询：某时间段内的事件列表
-  @@index([timestamp(sort: Desc)])
+  /// 看板查询：某项目某时间段内的事件列表（TC-08：project_id 打头）
+  @@index([projectId, timestamp(sort: Desc)])
   @@map("error_events")
 }
 
@@ -208,6 +260,10 @@ model ErrorEvent {
 model PerformanceMetric {
   /// SDK 生成的事件唯一 ID，用于 keepalive 重复投递时的去重
   eventId String @id @map("event_id") @db.VarChar(128)
+
+  /// 所属项目（S0 多租户）。NOT NULL，理由同 ErrorGroup。
+  projectId String  @map("project_id") @db.Uuid
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   /// 页面加载完成的时刻（客户端时钟）
   timestamp DateTime @db.Timestamptz
@@ -256,9 +312,10 @@ model PerformanceMetric {
   release     String? @db.VarChar(100)
   environment String? @db.VarChar(50)
 
-  /// 看板 90% 的查询是「某页面某时间段的指标趋势」和「最近 N 条」，两者都吃这两个索引
-  @@index([url, timestamp(sort: Desc)])
-  @@index([timestamp(sort: Desc)])
+  /// 看板 90% 的查询是「某项目某页面某时间段的指标趋势」和「最近 N 条」，
+  /// 全部以 project_id 打头才能吃到索引
+  @@index([projectId, url, timestamp(sort: Desc)])
+  @@index([projectId, timestamp(sort: Desc)])
   @@map("performance_metrics")
 }
 
@@ -275,14 +332,21 @@ model PerformanceMetric {
 model Release {
   id String @id @default(uuid()) @db.Uuid
 
+  /// 所属项目（S0 多租户）。NOT NULL，理由同 ErrorGroup。
+  projectId String  @map("project_id") @db.Uuid
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
   /// 版本号，如 web@1.2.4。**必须与 SDK initArgus({release}) 上报的字符串逐字节一致**，
-  /// 这是 Worker 从 error_events.release 查到本行的唯一依据
-  version String @unique @db.VarChar(100)
+  /// 这是 Worker 从 error_events.release 查到本行的唯一依据。
+  ///
+  /// 唯一性从 `version` 收窄为 **(projectId, version)**：不同项目可以用同一个版本号
+  version String @db.VarChar(100)
 
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   sourcemapFiles SourcemapFile[]
 
+  @@unique([projectId, version])
   @@map("releases")
 }
 

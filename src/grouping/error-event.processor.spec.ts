@@ -44,7 +44,11 @@ interface ClaimedEvent {
   timestamp: Date;
   /** M3：归并时用它找 Sourcemap；null = 没配版本，直接走 v1 */
   release: string | null;
+  /** S0：多租户归属。upsert 的唯一键是三元组，少了它就会退化成全局归并 */
+  project_id: string;
 }
+
+const TEST_PROJECT = '11111111-1111-1111-1111-111111111111';
 
 const CLAIMED: ClaimedEvent = {
   event_id: 'evt-1',
@@ -56,6 +60,7 @@ const CLAIMED: ClaimedEvent = {
     'TypeError: x\n    at renderSummary (http://127.0.0.1:8017/assets/index-a1b2c3.js:348:13)',
   timestamp: new Date('2026-01-01T00:00:00Z'),
   release: null,
+  project_id: TEST_PROJECT,
 };
 
 /** 假 Prisma：$transaction 直接把 tx 交给回调，$queryRaw 返回预置的声明结果 */
@@ -161,8 +166,12 @@ function fakeDlq(behavior: { add?: () => Promise<unknown> } = {}) {
  * 让默认实现全部降级，等价于"这个 release 没上传 Sourcemap"。
  */
 const DEGRADED_LOOKUP = {
-  symbolicate: (_db: unknown, _release: string | null, frames: Frame[]) =>
-    Promise.resolve(symbolicateFrames(frames, () => null)),
+  symbolicate: (
+    _db: unknown,
+    _projectId: string,
+    _release: string | null,
+    frames: Frame[],
+  ) => Promise.resolve(symbolicateFrames(frames, () => null)),
 } as unknown as SourcemapLookupService;
 
 /**
@@ -173,7 +182,12 @@ const DEGRADED_LOOKUP = {
  */
 function fullyResolvedLookup(): SourcemapLookupService {
   return {
-    symbolicate: (_db: unknown, release: string | null, frames: Frame[]) => {
+    symbolicate: (
+      _db: unknown,
+      _projectId: string,
+      release: string | null,
+      frames: Frame[],
+    ) => {
       if (release === null) {
         return Promise.resolve(symbolicateFrames(frames, () => null));
       }
@@ -265,9 +279,10 @@ describe('ErrorEventProcessor', () => {
         'tx:updateEvent',
       ]);
 
-      // upsert 的 where 用二元组唯一约束（MVP 去掉了 project_id）
+      // upsert 的 where 用三元组唯一约束（S0 起带 project_id）
       expect(prisma.upsertArgs?.where).toMatchObject({
-        groupingVersion_fingerprint: {
+        projectId_groupingVersion_fingerprint: {
+          projectId: TEST_PROJECT,
           groupingVersion: 'v1-raw',
           fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
         },
@@ -275,6 +290,7 @@ describe('ErrorEventProcessor', () => {
 
       // 首次创建：计数从 1 开始，首末时间都取自事件时间
       expect(prisma.upsertArgs?.create).toMatchObject({
+        projectId: TEST_PROJECT,
         groupingVersion: 'v1-raw',
         title: expect.stringContaining('TypeError:'),
         culprit: 'index.js:renderSummary',
@@ -301,12 +317,14 @@ describe('ErrorEventProcessor', () => {
 
       // 分组版本换成 v2（与 v1 并存，不覆盖历史问题）
       expect(prisma.upsertArgs?.where).toMatchObject({
-        groupingVersion_fingerprint: {
+        projectId_groupingVersion_fingerprint: {
+          projectId: TEST_PROJECT,
           groupingVersion: 'v2-symbolicated',
           fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
         },
       });
       expect(prisma.upsertArgs?.create).toMatchObject({
+        projectId: TEST_PROJECT,
         groupingVersion: 'v2-symbolicated',
         // culprit 用源码路径 + 源码函数名，而不是 index.js:renderSummary
         culprit: 'src/pages/OrderList.tsx:OrderList',

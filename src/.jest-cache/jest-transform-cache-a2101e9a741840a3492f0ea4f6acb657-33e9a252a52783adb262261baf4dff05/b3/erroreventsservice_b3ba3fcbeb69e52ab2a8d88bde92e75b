@@ -1,0 +1,269 @@
+63c5d606b703be26827a8df368412ad2
+"use strict";
+var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+var __param = (this && this.__param) || function (paramIndex, decorator) {
+    return function (target, key) { decorator(target, key, paramIndex); }
+};
+var ErrorEventsService_1;
+var _a;
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ErrorEventsService = void 0;
+const bullmq_1 = require("@nestjs/bullmq");
+const common_1 = require("@nestjs/common");
+const client_1 = require("../../generated/prisma/client");
+const prisma_service_1 = require("../prisma/prisma.service");
+const queue_constants_1 = require("../queue/queue.constants");
+let ErrorEventsService = ErrorEventsService_1 = class ErrorEventsService {
+    prisma;
+    queue;
+    logger = new common_1.Logger(ErrorEventsService_1.name);
+    constructor(prisma, queue) {
+        this.prisma = prisma;
+        this.queue = queue;
+    }
+    /**
+     * 把收到的异常事件**原样**打到控制台。
+     *
+     * 打的是 `payload` 本身（ValidationPipe 转出来的 DTO 实例），也就是
+     * 「校验通过、准备落库」的那份数据 —— 和入库内容是同一来源，不做任何裁剪。
+     * stack 全文、面包屑全部条目，一个字段都不省。
+     *
+     * 用 JSON.stringify(payload, null, 2) 而不是手写模板：
+     *   ① 不会漏字段 —— 以后 SDK 加字段，这里自动就有
+     *   ② 缩进格式，长对象也能读
+     * 头部那行是 JSON 的总长度，用来判断这条 payload 有多大（stack 长时会到几 KB）。
+     *
+     * 注意：DTO 里没声明的字段已经被 ValidationPipe 的 whitelist 剥掉了，
+     * 所以这里看不到"客户端多发的垃圾字段" —— 那属于被丢弃的数据，不是收到的数据。
+     */
+    logIncoming(payload) {
+        let pretty;
+        try {
+            pretty = JSON.stringify(payload, null, 2);
+        }
+        catch (err) {
+            // DTO 是普通对象，正常不会走到这里；真循环引用了也不能让日志把请求搞挂
+            this.logger.warn(`收到异常事件，但序列化失败: ${String(err)}`);
+            return;
+        }
+        this.logger.log(['', `收到异常事件（JSON ${pretty.length} 字符）`, '---', pretty, '---'].join('\n'));
+    }
+    /**
+     * 写入一条异常事件。同一 event_id 重复上报不会产生第二条记录。
+     *
+     * 去重实现和 Mongoose 时代的区别（语义不变，写法变了）：
+     *   旧写法是 findOneAndUpdate + upsert + includeResultMetadata，靠返回的
+     *   updatedExisting 判断「这条是插进去的，还是本来就有的」。
+     *   Prisma 的 upsert 不告诉你命中与否，所以改成 create + 捕获主键冲突：
+     *   撞主键（P2002）就等于「之前已经收到过」，结果与旧实现一致，且只发一条 SQL。
+     *
+     * W3 起多了一步：**写库成功后**往归并队列投一条 job（见 enqueue）。
+     * 顺序不能反 —— 先入队的话，Worker 可能比写库更快地拿到一个还查不到的主键。
+     * 两步之间刻意不做跨系统事务（Redis 与 PG 之间没有可靠的两阶段提交，硬凑出来的
+     * "事务"只会在其中一边挂着时留下更难查的状态）。代价是"入库成功但入队失败"，
+     * 由补扫任务兜住。
+     */
+    async ingest(payload, projectId) {
+        this.logIncoming(payload);
+        try {
+            await this.prisma.errorEvent.create({ data: this.toRow(payload, projectId) });
+        }
+        catch (err) {
+            if (err instanceof client_1.Prisma.PrismaClientKnownRequestError) {
+                // event_id 就是主键，所以撞唯一约束只可能是"这条事件重复上报"
+                if (err.code === 'P2002') {
+                    this.logger.debug(`事件已存在，跳过: ${payload.event_id}`);
+                    return { event_id: payload.event_id, duplicate: true };
+                }
+                // P2000 是值超出列宽。DTO 已经限了每个字段的长度，这里兜住两边漂移的情况
+                // （比如以后 schema 收窄、DTO 忘了同步），否则用户拿到的是 500 而不是 400
+                if (err.code === 'P2000') {
+                    throw new common_1.BadRequestException('字段长度超出数据库限制');
+                }
+            }
+            throw err;
+        }
+        await this.enqueue(payload.event_id);
+        return { event_id: payload.event_id, duplicate: false };
+    }
+    /**
+     * 投递一条归并任务。
+     *
+     * ── jobId 用 event_id ──────────────────────────────────────────────────
+     * 队列里同 jobId 的 job 还在时，BullMQ 会**静默忽略**这次 add（不报错、也不新建，
+     * 见 addStandardJob-9.js 的 handleDuplicatedJob），这是防重复入队的第一道闸。
+     * 注意它是"静默"的：别指望靠 catch 判断有没有入队成功。
+     * 形状不合法的 id（纯数字 / 含冒号）由 toJobId 先映射成合法形状。
+     *
+     * ── 失败为什么只记日志、不往上抛 ────────────────────────────────────────
+     * 事件已经落库了，真相保住了；入队失败只意味着"暂时没人处理它"，由补扫任务兜住。
+     * 反过来若抛出去：SDK 收到 500 会重试，而重试撞主键会被判成 duplicate、
+     * 在下面那条 duplicate 分支里直接返回 —— 照样不会入队，还多绕一圈。
+     *
+     * ── 只有新事件才入队 ───────────────────────────────────────────────────
+     * duplicate 分支不入队：这条事件上一次已经入过队（jobId 相同，去重窗口内会被
+     * 静默忽略），真要是上次入队失败，补扫会按 processed_at IS NULL 把它捞回来。
+     */
+    async enqueue(eventId) {
+        try {
+            await this.queue.add(queue_constants_1.ERROR_EVENT_JOB, { eventId }, { ...queue_constants_1.ERROR_EVENT_JOB_OPTIONS, jobId: (0, queue_constants_1.toJobId)(eventId) });
+        }
+        catch (err) {
+            this.logger.error(`入队失败，事件已入库但尚未归并（等补扫兜住）: event_id=${eventId} 原因=${String(err)}`);
+        }
+    }
+    /**
+     * DTO → 入库行：原始字段保留，同时补一份 exception 结构，
+     * 让「原始契约」和「后续归一化要用的结构」并存。
+     *
+     * 与 Mongoose 时代的区别：那时 sdk / exception.* 是嵌套对象，原样存进 Mongo 文档；
+     * PG 里它们被拍平成列，所以这里要把嵌套展开，字段名换成 schema 里的 camelCase 列名。
+     *
+     * 缺值统一落 null 而不是 ''：列可空，"SDK 没发这个字段"和"发了个空串"是两件事，
+     * 用空串兜底会把后者的信息也抹掉。
+     */
+    toRow(payload, projectId) {
+        return {
+            eventId: payload.event_id,
+            // 所属项目：由控制器从上报公钥反查得到，客户端无从指定（TC-05）
+            projectId,
+            // DTO 的取值联合与 schema 的 Mechanism enum 一一对应（onerror / unhandledrejection / resource），
+            // 所以这里直接赋，不需要转换或做映射表
+            mechanism: payload.mechanism,
+            type: payload.type,
+            message: payload.message,
+            stack: payload.stack ?? null,
+            source: payload.source ?? null,
+            timestamp: payload.timestamp ? new Date(payload.timestamp) : new Date(),
+            url: payload.url ?? '',
+            userAgent: payload.user_agent ?? '',
+            sdkName: payload.sdk?.name ?? null,
+            sdkVersion: payload.sdk?.version ?? null,
+            // 版本与环境：M3 的 Sourcemap 按 release 找 map（FR-3.4）。
+            // 这里漏了不会报任何错，只会让 error_events.release 恒为 NULL ——
+            // 直到做「受控重算」时才发现历史数据全都无从匹配
+            release: payload.release ?? null,
+            environment: payload.environment ?? null,
+            // exception.* 是给读取侧归一化/指纹用的同一份数据（原始契约在上面那几列）
+            exceptionType: payload.type,
+            exceptionValue: payload.message,
+            exceptionMechanism: payload.mechanism,
+            // raw 原样保留：归一化与指纹都在读取侧做，写入侧不做加工
+            stacktraceRaw: payload.stack ?? null,
+            // stacktraceFrames 有意不写：frames 由读取侧解析回填。现在写 null 是"没有 frames"，
+            // 写 [] 是"解析过且为空"，两个都不是当前事实 —— 不写，列就是 SQL NULL。
+            //
+            // 面包屑原样落库：形状是 SDK 的事，读取侧（看板时间线 FR-8.6）再渲染。
+            // 用展开而不是 `breadcrumbs: payload.breadcrumbs ?? null`：Json? 列不能直接写 null
+            // （类型是 NullableJsonNullValueInput | InputJsonValue，且 Prisma.JsonNull 存的是
+            // JSON 的 null、Prisma.DbNull 才是 SQL NULL）。字段整个不出现，语义最干净。
+            ...(payload.breadcrumbs
+                ? { breadcrumbs: payload.breadcrumbs }
+                : {}),
+        };
+    }
+    /**
+     * 分页查询异常事件，按事件时间倒序。
+     *
+     * 响应形状（字段统一 snake_case，与 SDK 上报契约、ingest 响应保持一致）：
+     * {
+     *   items: [{
+     *     event_id, mechanism, type, message, stack, source,
+     *     timestamp, received_at, url, user_agent,
+     *     sdk_name, sdk_version,
+     *     exception_type, exception_value, exception_mechanism,
+     *     stacktrace_raw, stacktrace_frames,
+     *     user_id, session_id, release, environment,
+     *     tags, extra, breadcrumbs,
+     *   }],
+     *   total, page, pageSize,
+     * }
+     *
+     * 两个刻意的选择：
+     *   ① orderBy 用 timestamp 而不是 received_at —— 表上只有
+     *      @@index([timestamp(sort: Desc)])，换字段就是全表 sort
+     *   ② 列表与总数放进同一个 $transaction —— 同一事务快照，并发写入时不会
+     *      出现"total=10 但翻到第 2 页是空的"这种自相矛盾
+     *
+     * 过渡接口：M4-S2 起 projectId 必填（来自查询参数，S4 后改由 JWT 决定）。
+     * 另注：count() 在几十万行时是全表扫描，M2 之后趋势类查询改读预聚合表。
+     */
+    async listErrorEvents(projectId, page, pageSize) {
+        const where = { projectId };
+        const [rows, total] = await this.prisma.$transaction([
+            this.prisma.errorEvent.findMany({
+                where,
+                orderBy: { timestamp: 'desc' },
+                skip: (page - 1) * pageSize,
+                take: pageSize,
+            }),
+            this.prisma.errorEvent.count({ where }),
+        ]);
+        return {
+            items: rows.map((row) => this.toApiRow(row)),
+            total,
+            page,
+            pageSize,
+        };
+    }
+    /**
+     * 数据库行 → 接口响应。
+     *
+     * 为什么不直接 return rows：Prisma 返回的是内部模型形状，以后给表加了仅供
+     * 内部使用的列，它会自动出现在响应里。字段在这里显式列出 = 接口契约由这里定。
+     *
+     * 三处不用特殊处理：
+     *   · Date 经 JSON.stringify 自动序列化成 ISO 8601 UTC 字符串（符合 SRS §8）
+     *   · Json 列的 null 保持 null，不会被抹成缺字段
+     *   · 本表没有 BigInt 列，不会踩 JSON.stringify 不支持 BigInt 的坑
+     */
+    toApiRow(row) {
+        return {
+            event_id: row.eventId,
+            mechanism: row.mechanism,
+            type: row.type,
+            message: row.message,
+            stack: row.stack,
+            source: row.source,
+            timestamp: row.timestamp,
+            received_at: row.receivedAt,
+            url: row.url,
+            user_agent: row.userAgent,
+            sdk_name: row.sdkName,
+            sdk_version: row.sdkVersion,
+            exception_type: row.exceptionType,
+            exception_value: row.exceptionValue,
+            exception_mechanism: row.exceptionMechanism,
+            stacktrace_raw: row.stacktraceRaw,
+            stacktrace_frames: row.stacktraceFrames,
+            user_id: row.userId,
+            session_id: row.sessionId,
+            release: row.release,
+            environment: row.environment,
+            tags: row.tags,
+            extra: row.extra,
+            breadcrumbs: row.breadcrumbs,
+            /// 归并到的问题 ID，NULL = 尚未归并（M1 阶段恒为 NULL）。
+            /// 看板拿它多显示一列，但**默认列表不做任何过滤** ——
+            /// 一旦按 group_id IS NULL 过滤，Worker 归并得越成功、看板就越空。
+            group_id: row.groupId,
+            // processed_at 有意不暴露：它是 Worker 的幂等闸门（内部进度），
+            // 不是给用户看的"已读"标记。暴露它等于让处理进度决定用户能看到什么。
+        };
+    }
+};
+exports.ErrorEventsService = ErrorEventsService;
+exports.ErrorEventsService = ErrorEventsService = ErrorEventsService_1 = __decorate([
+    (0, common_1.Injectable)(),
+    __param(1, (0, bullmq_1.InjectQueue)(queue_constants_1.ERROR_EVENT_QUEUE)),
+    __metadata("design:paramtypes", [typeof (_a = typeof prisma_service_1.PrismaService !== "undefined" && prisma_service_1.PrismaService) === "function" ? _a : Object, Object])
+], ErrorEventsService);
+//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJmaWxlIjoiRTpcXEFyZ3VzXFxiYWNrZW5kXFxzcmNcXGVycm9yLWV2ZW50c1xcZXJyb3ItZXZlbnRzLnNlcnZpY2UudHMiLCJtYXBwaW5ncyI6Ijs7Ozs7Ozs7Ozs7Ozs7Ozs7QUFBQSwyQ0FBNkM7QUFDN0MsMkNBQXlFO0FBRXpFLDBEQUF3RTtBQUN4RSw2REFBeUQ7QUFDekQsOERBTWtDO0FBVTNCLElBQU0sa0JBQWtCLDBCQUF4QixNQUFNLGtCQUFrQjtJQUlWO0lBQ2dDO0lBSmxDLE1BQU0sR0FBRyxJQUFJLGVBQU0sQ0FBQyxvQkFBa0IsQ0FBQyxJQUFJLENBQUMsQ0FBQztJQUU5RCxZQUNtQixNQUFxQixFQUNXLEtBQStCO1FBRC9ELFdBQU0sR0FBTixNQUFNLENBQWU7UUFDVyxVQUFLLEdBQUwsS0FBSyxDQUEwQjtJQUMvRSxDQUFDO0lBRUo7Ozs7Ozs7Ozs7Ozs7O09BY0c7SUFDSyxXQUFXLENBQUMsT0FBdUI7UUFDekMsSUFBSSxNQUFjLENBQUM7UUFDbkIsSUFBSSxDQUFDO1lBQ0gsTUFBTSxHQUFHLElBQUksQ0FBQyxTQUFTLENBQUMsT0FBTyxFQUFFLElBQUksRUFBRSxDQUFDLENBQUMsQ0FBQztRQUM1QyxDQUFDO1FBQUMsT0FBTyxHQUFHLEVBQUUsQ0FBQztZQUNiLHVDQUF1QztZQUN2QyxJQUFJLENBQUMsTUFBTSxDQUFDLElBQUksQ0FBQyxrQkFBa0IsTUFBTSxDQUFDLEdBQUcsQ0FBQyxFQUFFLENBQUMsQ0FBQztZQUNsRCxPQUFPO1FBQ1QsQ0FBQztRQUVELElBQUksQ0FBQyxNQUFNLENBQUMsR0FBRyxDQUFDLENBQUMsRUFBRSxFQUFFLGVBQWUsTUFBTSxDQUFDLE1BQU0sTUFBTSxFQUFFLEtBQUssRUFBRSxNQUFNLEVBQUUsS0FBSyxDQUFDLENBQUMsSUFBSSxDQUFDLElBQUksQ0FBQyxDQUFDLENBQUM7SUFDN0YsQ0FBQztJQUVEOzs7Ozs7Ozs7Ozs7OztPQWNHO0lBQ0gsS0FBSyxDQUFDLE1BQU0sQ0FBQyxPQUF1QixFQUFFLFNBQWlCO1FBQ3JELElBQUksQ0FBQyxX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STtZQUNkLEtBQUssRUFBRSxHQUFHLENBQUMsS0FBSztZQUNoQixXQUFXLEVBQUUsR0FBRyxDQUFDLFdBQVc7WUFDNUIsd0NBQXdDO1lBQ3hDLGdDQUFnQztZQUNoQyxnREFBZ0Q7WUFDaEQsUUFBUSxFQUFFLEdBQUcsQ0FBQyxPQUFPO1lBQ3JCLDRDQUE0QztZQUM1QyxxQ0FBcUM7U0FDdEMsQ0FBQztJQUNKLENBQUM7Q0FDRixDQUFBO0FBM1BZLGdEQUFrQjs2QkFBbEIsa0JBQWtCO0lBRDlCLElBQUEsbUJBQVUsR0FBRTtJQU1SLFdBQUEsSUFBQSxvQkFBVyxFQUFDLG1DQUFpQixDQUFDLENBQUE7eURBRE4sOEJBQWEsb0JBQWIsOEJBQWE7R0FKN0Isa0JBQWtCLENBMlA5QiIsIm5hbWVzIjpbXSwic291cmNlcyI6WyJFOlxcQXJndXNcXGJhY2tlbmRcXHNyY1xcZXJyb3ItZXZlbnRzXFxlcnJvci1ldmVudHMuc2VydmljZS50cyJdLCJzb3VyY2VzQ29udGVudCI6WyJpbXBvcnQgeyBJbmplY3RRdWV1ZSB9IGZyb20gJ0BuZXN0anMvYnVsbG1xJztcbmltcG9ydCB7IEJhZFJlcXVlc3RFeGNlcHRpb24sIEluamVjdGFibGUsIExvZ2dlciB9IGZyb20gJ0BuZXN0anMvY29tbW9uJztcbmltcG9ydCB0eXBlIHsgUXVldWUgfSBmcm9tICdidWxsbXEnO1xuaW1wb3J0IHsgUHJpc21hLCB0eXBlIEVycm9yRXZlbnQgfSBmcm9tICcuLi8uLi9nZW5lcmF0ZWQvcHJpc21hL2NsaWVudCc7XG5pbXBvcnQgeyBQcmlzbWFTZXJ2aWNlIH0gZnJvbSAnLi4vcHJpc21hL3ByaXNtYS5zZXJ2aWNlJztcbmltcG9ydCB7XG4gIEVSUk9SX0VWRU5UX0pPQixcbiAgRVJST1JfRVZFTlRfSk9CX09QVElPTlMsXG4gIEVSUk9SX0VWRU5UX1FVRVVFLFxuICB0b0pvYklkLFxuICB0eXBlIEVycm9yRXZlbnRKb2JEYXRhLFxufSBmcm9tICcuLi9xdWV1ZS9xdWV1ZS5jb25zdGFudHMnO1xuaW1wb3J0IHsgSW5nZXN0RXJyb3JEdG8gfSBmcm9tICcuL2R0by9pbmdlc3QtZXJyb3IuZHRvJztcblxuZXhwb3J0IGludGVyZmFjZSBJbmdlc3RSZXN1bHQge1xuICBldmVudF9pZDogc3RyaW5nO1xuICAvKiogdHJ1ZSDooajnpLrov5nmnaHkuovku7bkuYvliY3lt7LmlLbliLDov4fvvIjpnaAgZXZlbnRfaWQg5Li76ZSu5Yay56qB5Y676YeN77yJICovXG4gIGR1cGxpY2F0ZTogYm9vbGVhbjtcbn1cblxuQEluamVjdGFibGUoKVxuZXhwb3J0IGNsYXNzIEVycm9yRXZlbnRzU2VydmljZSB7XG4gIHByaXZhdGUgcmVhZG9ubHkgbG9nZ2VyID0gbmV3IExvZ2dlcihFcnJvckV2ZW50c1NlcnZpY2UubmFtZSk7XG5cbiAgY29uc3RydWN0b3IoXG4gICAgcHJpdmF0ZSByZWFkb25seSBwcmlzbWE6IFByaXNtYVNlcnZpY2UsXG4gICAgQEluamVjdFF1ZXVlKEVSUk9SX0VWRU5UX1FVRVVFKSBwcml2YXRlIHJlYWRvbmx5IHF1ZXVlOiBRdWV1ZTxFcnJvckV2ZW50Sm9iRGF0YT4sXG4gICkge31cblxuICAvKipcbiAgICog5oqK5pS25Yiw55qE5byC5bi45LqL5Lu2Kirljp/moLcqKuaJk+WIsOaOp+WItuWPsOOAglxuICAgKlxuICAgKiDmiZPnmoTmmK8gYHBheWxvYWRgIOacrOi6q++8iFZhbGlkYXRpb25QaXBlIOi9rOWHuuadpeeahCBEVE8g5a6e5L6L77yJ77yM5Lmf5bCx5pivXG4gICAqIOOAjOagoemqjOmAmui/h+OAgeWHhuWkh+iQveW6k+OAjeeahOmCo+S7veaVsOaNriDigJTigJQg5ZKM5YWl5bqT5YaF5a655piv5ZCM5LiA5p2l5rqQ77yM5LiN5YGa5Lu75L2V6KOB5Ymq44CCXG4gICAqIHN0YWNrIOWFqOaWh+OAgemdouWMheWxkeWFqOmDqOadoeebru+8jOS4gOS4quWtl+autemDveS4jeecgeOAglxuICAgKlxuICAgKiDnlKggSlNPTi5zdHJpbmdpZnkocGF5bG9hZCwgbnVsbCwgMikg6ICM5LiN5piv5omL5YaZ5qih5p2/77yaXG4gICAqICAg4pGgIOS4jeS8mua8j+Wtl+autSDigJTigJQg5Lul5ZCOIFNESyDliqDlrZfmrrXvvIzov5nph4zoh6rliqjlsLHmnIlcbiAgICogICDikaEg57yp6L+b5qC85byP77yM6ZW/5a+56LGh5Lmf6IO96K+7XG4gICAqIOWktOmDqOmCo+ihjOaYryBKU09OIOeahOaAu+mVv+W6pu+8jOeUqOadpeWIpOaWrei/meadoSBwYXlsb2FkIOacieWkmuWkp++8iHN0YWNrIOmVv+aXtuS8muWIsOWHoCBLQu+8ieOAglxuICAgKlxuICAgKiDms6jmhI/vvJpEVE8g6YeM5rKh5aOw5piO55qE5a2X5q615bey57uP6KKrIFZhbGlkYXRpb25QaXBlIOeahCB3aGl0ZWxpc3Qg5Yml5o6J5LqG77yMXG4gICAqIOaJgOS7pei/memHjOeci+S4jeWIsFwi5a6i5oi356uv5aSa5Y+R55qE5Z6D5Zy+5a2X5q61XCIg4oCU4oCUIOmCo+WxnuS6juiiq+S4ouW8g+eahOaVsOaNru+8jOS4jeaYr+aUtuWIsOeahOaVsOaNruOAglxuICAgKi9cbiAgcHJpdmF0ZSBsb2dJbmNvbWluZyhwYXlsb2FkOiBJbmdlc3RFcnJvckR0byk6IHZvaWQge1xuICAgIGxldCBwcmV0dHk6IHN0cmluZztcbiAgICB0cnkge1xuICAgICAgcHJldHR5ID0gSlNPTi5zdHJpbmdpZnkocGF5bG9hZCwgbnVsbCwgMik7XG4gICAgfSBjYXRjaCAoZXJyKSB7XG4gICAgICAvLyBEVE8g5piv5pmu6YCa5a+56LGh77yM5q2j5bi45LiN5Lya6LWw5Yiw6L+Z6YeM77yb55yf5b6q546v5byV55So5LqG5Lmf5LiN6IO96K6p5pel5b+X5oqK6K+35rGC5pCe5oyCXG4gICAgICB0aGlzLmxvZ2dlci53YXJuKGDmlLbliLDlvILluLjkuovku7bvvIzkvYbluo/liJfljJblpLHotKU6ICR7U3RyaW5nKGVycil9YCk7XG4gICAgICByZXR1cm47XG4gICAgfVxuXG4gICAgdGhpcy5sb2dnZXIubG9nKFsnJywgYOaUtuWIsOW8guW4uOS6i+S7tu+8iEpTT04gJHtwcmV0dHkubGVuZ3RofSDlrZfnrKbvvIlgLCAnLS0tJywgcHJldHR5LCAnLS0tJ10uam9pbignXFxuJykpO1xuICB9XG5cbiAgLyoqXG4gICAqIOWGmeWFpeS4gOadoeW8guW4uOS6i+S7tuOAguWQjOS4gCBldmVudF9pZCDph43lpI3kuIrmiqXkuI3kvJrkuqfnlJ/nrKzkuozmnaHorrDlvZXjgIJcbiAgICpcbiAgICog5Y676YeN5a6e546w5ZKMIE1vbmdvb3NlIOaXtuS7o+eahOWMuuWIq++8iOivreS5ieS4jeWPmO+8jOWGmeazleWPmOS6hu+8ie+8mlxuICAgKiAgIOaXp+WGmeazleaYryBmaW5kT25lQW5kVXBkYXRlICsgdXBzZXJ0ICsgaW5jbHVkZVJlc3VsdE1ldGFkYXRh77yM6Z2g6L+U5Zue55qEXG4gICAqICAgdXBkYXRlZEV4aXN0aW5nIOWIpOaWreOAjOi/meadoeaYr+aPkui/m+WOu+eahO+8jOi/mOaYr+acrOadpeWwseacieeahOOAjeOAglxuICAgKiAgIFByaXNtYSDnmoQgdXBzZXJ0IOS4jeWRiuivieS9oOWRveS4reS4juWQpu+8jOaJgOS7peaUueaIkCBjcmVhdGUgKyDmjZXojrfkuLvplK7lhrLnqoHvvJpcbiAgICogICDmkp7kuLvplK7vvIhQMjAwMu+8ieWwseetieS6juOAjOS5i+WJjeW3sue7j+aUtuWIsOi/h+OAje+8jOe7k+aenOS4juaXp+WunueOsOS4gOiHtO+8jOS4lOWPquWPkeS4gOadoSBTUUzjgIJcbiAgICpcbiAgICogVzMg6LW35aSa5LqG5LiA5q2l77yaKirlhpnlupPmiJDlip/lkI4qKuW+gOW9kuW5tumYn+WIl+aKleS4gOadoSBqb2LvvIjop4EgZW5xdWV1Ze+8ieOAglxuICAgKiDpobrluo/kuI3og73lj40g4oCU4oCUIOWFiOWFpemYn+eahOivne+8jFdvcmtlciDlj6/og73mr5TlhpnlupPmm7Tlv6vlnLDmi7/liLDkuIDkuKrov5jmn6XkuI3liLDnmoTkuLvplK7jgIJcbiAgICog5Lik5q2l5LmL6Ze05Yi75oSP5LiN5YGa6Leo57O757uf5LqL5Yqh77yIUmVkaXMg5LiOIFBHIOS5i+mXtOayoeacieWPr+mdoOeahOS4pOmYtuauteaPkOS6pO+8jOehrOWHkeWHuuadpeeahFxuICAgKiBcIuS6i+WKoVwi5Y+q5Lya5Zyo5YW25Lit5LiA6L655oyC552A5pe255WZ5LiL5pu06Zq+5p+l55qE54q25oCB77yJ44CC5Luj5Lu35pivXCLlhaXlupPmiJDlip/kvYblhaXpmJ/lpLHotKVcIu+8jFxuICAgKiDnlLHooaXmiavku7vliqHlhZzkvY/jgIJcbiAgICovXG4gIGFzeW5jIGluZ2VzdChwYXlsb2FkOiBJbmdlc3RFcnJvckR0bywgcHJvamVjdElkOiBzdHJpbmcpOiBQcm9taXNlPEluZ2VzdFJlc3VsdD4ge1xuICAgIHRoaXMubG9nSW5jb21pbmcocGF5bG9hZCk7XG5cbiAgICB0cnkge1xuICAgICAgYXdhaXQgdGhpcy5wcmlzbWEuZXJyb3JFdmVudC5jcmVhdGUoeyBkYXRhOiB0aGlzLnRvUm93KHBheWxvYWQsIHByb2plY3RJZCkgfSk7XG4gICAgfSBjYXRjaCAoZXJyKSB7XG4gICAgICBpZiAoZXJyIGluc3RhbmNlb2YgUHJpc21hLlByaXNtYUNsaWVudEtub3duUmVxdWVzdEVycm9yKSB7XG4gICAgICAgIC8vIGV2ZW50X2lkIOWwseaYr+S4u+mUru+8jOaJgOS7peaSnuWUr+S4gOe6puadn+WPquWPr+iDveaYr1wi6L+Z5p2h5LqL5Lu26YeN5aSN5LiK5oqlXCJcbiAgICAgICAgaWYgKGVyci5jb2RlID09PSAnUDIwMDInKSB7XG4gICAgICAgICAgdGhpcy5sb2dnZXIuZGVidWcoYOS6i+S7tuW3suWtmOWcqO+8jOi3s+i/hzogJHtwYXlsb2FkLmV2ZW50X2lkfWApO1xuICAgICAgICAgIHJldHVybiB7IGV2ZW50X2lkOiBwYXlsb2FkLmV2ZW50X2lkLCBkdXBsaWNhdGU6IHRydWUgfTtcbiAgICAgICAgfVxuICAgICAgICAvLyBQMjAwMCDmmK/lgLzotoXlh7rliJflrr3jgIJEVE8g5bey57uP6ZmQ5LqG5q+P5Liq5a2X5q6155qE6ZW/5bqm77yM6L+Z6YeM5YWc5L2P5Lik6L655ryC56e755qE5oOF5Ya1XG4gICAgICAgIC8vIO+8iOavlOWmguS7peWQjiBzY2hlbWEg5pS256qE44CBRFRPIOW/mOS6huWQjOatpe+8ie+8jOWQpuWImeeUqOaIt+aLv+WIsOeahOaYryA1MDAg6ICM5LiN5pivIDQwMFxuICAgICAgICBpZiAoZXJyLmNvZGUgPT09ICdQMjAwMCcpIHtcbiAgICAgICAgICB0aHJvdyBuZXcgQmFkUmVxdWVzdEV4Y2VwdGlvbign5a2X5q616ZW/5bqm6LaF5Ye65pWw5o2u5bqT6ZmQ5Yi2Jyk7XG4gICAgICAgIH1cbiAgICAgIH1cbiAgICAgIHRocm93IGVycjtcbiAgICB9XG5cbiAgICBhd2FpdCB0aGlzLmVucXVldWUocGF5bG9hZC5ldmVudF9pZCk7XG5cbiAgICByZXR1cm4geyBldmVudF9pZDogcGF5bG9hZC5ldmVudF9pZCwgZHVwbGljYXRlOiBmYWxzZSB9O1xuICB9XG5cbiAgLyoqXG4gICAqIOaKlemAkuS4gOadoeW9kuW5tuS7u+WKoeOAglxuICAgKlxuICAgKiDilIDilIAgam9iSWQg55SoIGV2ZW50X2lkIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgFxuICAgKiDpmJ/liJfph4zlkIwgam9iSWQg55qEIGpvYiDov5jlnKjml7bvvIxCdWxsTVEg5LyaKirpnZnpu5jlv73nlaUqKui/measoSBhZGTvvIjkuI3miqXplJnjgIHkuZ/kuI3mlrDlu7rvvIxcbiAgICog6KeBIGFkZFN0YW5kYXJkSm9iLTkuanMg55qEIGhhbmRsZUR1cGxpY2F0ZWRKb2LvvInvvIzov5nmmK/pmLLph43lpI3lhaXpmJ/nmoTnrKzkuIDpgZPpl7jjgIJcbiAgICog5rOo5oSP5a6D5pivXCLpnZnpu5hcIueahO+8muWIq+aMh+acm+mdoCBjYXRjaCDliKTmlq3mnInmsqHmnInlhaXpmJ/miJDlip/jgIJcbiAgICog5b2i54q25LiN5ZCI5rOV55qEIGlk77yI57qv5pWw5a2XIC8g5ZCr5YaS5Y+377yJ55SxIHRvSm9iSWQg5YWI5pig5bCE5oiQ5ZCI5rOV5b2i54q244CCXG4gICAqXG4gICAqIOKUgOKUgCDlpLHotKXkuLrku4DkuYjlj6rorrDml6Xlv5fjgIHkuI3lvoDkuIrmipsg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4gICAqIOS6i+S7tuW3sue7j+iQveW6k+S6hu+8jOecn+ebuOS/neS9j+S6hu+8m+WFpemYn+Wksei0peWPquaEj+WRs+edgFwi5pqC5pe25rKh5Lq65aSE55CG5a6DXCLvvIznlLHooaXmiavku7vliqHlhZzkvY/jgIJcbiAgICog5Y+N6L+H5p2l6Iul5oqb5Ye65Y6777yaU0RLIOaUtuWIsCA1MDAg5Lya6YeN6K+V77yM6ICM6YeN6K+V5pKe5Li76ZSu5Lya6KKr5Yik5oiQIGR1cGxpY2F0ZeOAgVxuICAgKiDlnKjkuIvpnaLpgqPmnaEgZHVwbGljYXRlIOWIhuaUr+mHjOebtOaOpei/lOWbniDigJTigJQg54Wn5qC35LiN5Lya5YWl6Zif77yM6L+Y5aSa57uV5LiA5ZyI44CCXG4gICAqXG4gICAqIOKUgOKUgCDlj6rmnInmlrDkuovku7bmiY3lhaXpmJ8g4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4gICAqIGR1cGxpY2F0ZSDliIbmlK/kuI3lhaXpmJ/vvJrov5nmnaHkuovku7bkuIrkuIDmrKHlt7Lnu4/lhaXov4fpmJ/vvIhqb2JJZCDnm7jlkIzvvIzljrvph43nqpflj6PlhoXkvJrooqtcbiAgICog6Z2Z6buY5b+955Wl77yJ77yM55yf6KaB5piv5LiK5qyh5YWl6Zif5aSx6LSl77yM6KGl5omr5Lya5oyJIHByb2Nlc3NlZF9hdCBJUyBOVUxMIOaKiuWug+aNnuWbnuadpeOAglxuICAgKi9cbiAgcHJpdmF0ZSBhc3luYyBlbnF1ZXVlKGV2ZW50SWQ6IHN0cmluZyk6IFByb21pc2U8dm9pZD4ge1xuICAgIHRyeSB7XG4gICAgICBhd2FpdCB0aGlzLnF1ZXVlLmFkZChcbiAgICAgICAgRVJST1JfRVZFTlRfSk9CLFxuICAgICAgICB7IGV2ZW50SWQgfSxcbiAgICAgICAgeyAuLi5FUlJPUl9FVkVOVF9KT0JfT1BUSU9OUywgam9iSWQ6IHRvSm9iSWQoZXZlbnRJZCkgfSxcbiAgICAgICk7XG4gICAgfSBjYXRjaCAoZXJyKSB7XG4gICAgICB0aGlzLmxvZ2dlci5lcnJvcihcbiAgICAgICAgYOWFpemYn+Wksei0pe+8jOS6i+S7tuW3suWFpeW6k+S9huWwmuacquW9kuW5tu+8iOetieihpeaJq+WFnOS9j++8iTogZXZlbnRfaWQ9JHtldmVudElkfSDljp/lm6A9JHtTdHJpbmcoZXJyKX1gLFxuICAgICAgKTtcbiAgICB9XG4gIH1cblxuICAvKipcbiAgICogRFRPIOKGkiDlhaXlupPooYzvvJrljp/lp4vlrZfmrrXkv53nlZnvvIzlkIzml7booaXkuIDku70gZXhjZXB0aW9uIOe7k+aehO+8jFxuICAgKiDorqnjgIzljp/lp4vlpZHnuqbjgI3lkozjgIzlkI7nu63lvZLkuIDljJbopoHnlKjnmoTnu5PmnoTjgI3lubblrZjjgIJcbiAgICpcbiAgICog5LiOIE1vbmdvb3NlIOaXtuS7o+eahOWMuuWIq++8mumCo+aXtiBzZGsgLyBleGNlcHRpb24uKiDmmK/ltYzlpZflr7nosaHvvIzljp/moLflrZjov5sgTW9uZ28g5paH5qGj77ybXG4gICAqIFBHIOmHjOWug+S7rOiiq+aLjeW5s+aIkOWIl++8jOaJgOS7pei/memHjOimgeaKiuW1jOWll+WxleW8gO+8jOWtl+auteWQjeaNouaIkCBzY2hlbWEg6YeM55qEIGNhbWVsQ2FzZSDliJflkI3jgIJcbiAgICpcbiAgICog57y65YC857uf5LiA6JC9IG51bGwg6ICM5LiN5pivICcn77ya5YiX5Y+v56m677yMXCJTREsg5rKh5Y+R6L+Z5Liq5a2X5q61XCLlkoxcIuWPkeS6huS4quepuuS4slwi5piv5Lik5Lu25LqL77yMXG4gICAqIOeUqOepuuS4suWFnOW6leS8muaKiuWQjuiAheeahOS/oeaBr+S5n+aKueaOieOAglxuICAgKi9cbiAgcHJpdmF0ZSB0b1JvdyhwYXlsb2FkOiBJbmdlc3RFcnJvckR0bywgcHJvamVjdElkOiBzdHJpbmcpOiBQcmlzbWEuRXJyb3JFdmVudFVuY2hlY2tlZENyZWF0ZUlucHV0IHtcbiAgICByZXR1cm4ge1xuICAgICAgZXZlbnRJZDogcGF5bG9hZC5ldmVudF9pZCxcbiAgICAgIC8vIOaJgOWxnumhueebru+8mueUseaOp+WItuWZqOS7juS4iuaKpeWFrOmSpeWPjeafpeW+l+WIsO+8jOWuouaIt+err+aXoOS7juaMh+Wumu+8iFRDLTA177yJXG4gICAgICBwcm9qZWN0SWQsXG4gICAgICAvLyBEVE8g55qE5Y+W5YC86IGU5ZCI5LiOIHNjaGVtYSDnmoQgTWVjaGFuaXNtIGVudW0g5LiA5LiA5a+55bqU77yIb25lcnJvciAvIHVuaGFuZGxlZHJlamVjdGlvbiAvIHJlc291cmNl77yJ77yMXG4gICAgICAvLyDmiYDku6Xov5nph4znm7TmjqXotYvvvIzkuI3pnIDopoHovazmjaLmiJblgZrmmKDlsITooahcbiAgICAgIG1lY2hhbmlzbTogcGF5bG9hZC5tZWNoYW5pc20sXG4gICAgICB0eXBlOiBwYXlsb2FkLnR5cGUsXG4gICAgICBtZXNzYWdlOiBwYXlsb2FkLm1lc3NhZ2UsXG4gICAgICBzdGFjazogcGF5bG9hZC5zdGFjayA/PyBudWxsLFxuICAgICAgc291cmNlOiBwYXlsb2FkLnNvdXJjZSA/PyBudWxsLFxuICAgICAgdGltZXN0YW1wOiBwYXlsb2FkLnRpbWVzdGFtcCA/IG5ldyBEYXRlKHBheWxvYWQudGltZXN0YW1wKSA6IG5ldyBEYXRlKCksXG4gICAgICB1cmw6IHBheWxvYWQudXJsID8/ICcnLFxuICAgICAgdXNlckFnZW50OiBwYXlsb2FkLnVzZXJfYWdlbnQgPz8gJycsXG4gICAgICBzZGtOYW1lOiBwYXlsb2FkLnNkaz8ubmFtZSA/PyBudWxsLFxuICAgICAgc2RrVmVyc2lvbjogcGF5bG9hZC5zZGs/LnZlcnNpb24gPz8gbnVsbCxcbiAgICAgIC8vIOeJiOacrOS4jueOr+Wig++8mk0zIOeahCBTb3VyY2VtYXAg5oyJIHJlbGVhc2Ug5om+IG1hcO+8iEZSLTMuNO+8ieOAglxuICAgICAgLy8g6L+Z6YeM5ryP5LqG5LiN5Lya5oql5Lu75L2V6ZSZ77yM5Y+q5Lya6K6pIGVycm9yX2V2ZW50cy5yZWxlYXNlIOaBkuS4uiBOVUxMIOKAlOKAlFxuICAgICAgLy8g55u05Yiw5YGa44CM5Y+X5o6n6YeN566X44CN5pe25omN5Y+R546w5Y6G5Y+y5pWw5o2u5YWo6YO95peg5LuO5Yy56YWNXG4gICAgICByZWxlYXNlOiBwYXlsb2FkLnJlbGVhc2UgPz8gbnVsbCxcbiAgICAgIGVudmlyb25tZW50OiBwYXlsb2FkLmVudmlyb25tZW50ID8/IG51bGwsXG4gICAgICAvLyBleGNlcHRpb24uKiDmmK/nu5nor7vlj5bkvqflvZLkuIDljJYv5oyH57q555So55qE5ZCM5LiA5Lu95pWw5o2u77yI5Y6f5aeL5aWR57qm5Zyo5LiK6Z2i6YKj5Yeg5YiX77yJXG4gICAgICBleGNlcHRpb25UeXBlOiBwYXlsb2FkLnR5cGUsXG4gICAgICBleGNlcHRpb25WYWx1ZTogcGF5bG9hZC5tZXNzYWdlLFxuICAgICAgZXhjZXB0aW9uTWVjaGFuaXNtOiBwYXlsb2FkLm1lY2hhbmlzbSxcbiAgICAgIC8vIHJhdyDljp/moLfkv53nlZnvvJrlvZLkuIDljJbkuI7mjIfnurnpg73lnKjor7vlj5bkvqflgZrvvIzlhpnlhaXkvqfkuI3lgZrliqDlt6VcbiAgICAgIHN0YWNrdHJhY2VSYXc6IHBheWxvYWQuc3RhY2sgPz8gbnVsbCxcbiAgICAgIC8vIHN0YWNrdHJhY2VGcmFtZXMg5pyJ5oSP5LiN5YaZ77yaZnJhbWVzIOeUseivu+WPluS+p+ino+aekOWbnuWhq+OAgueOsOWcqOWGmSBudWxsIOaYr1wi5rKh5pyJIGZyYW1lc1wi77yMXG4gICAgICAvLyDlhpkgW10g5pivXCLop6PmnpDov4fkuJTkuLrnqbpcIu+8jOS4pOS4qumDveS4jeaYr+W9k+WJjeS6i+WuniDigJTigJQg5LiN5YaZ77yM5YiX5bCx5pivIFNRTCBOVUxM44CCXG4gICAgICAvL1xuICAgICAgLy8g6Z2i5YyF5bGR5Y6f5qC36JC95bqT77ya5b2i54q25pivIFNESyDnmoTkuovvvIzor7vlj5bkvqfvvIjnnIvmnb/ml7bpl7Tnur8gRlItOC4277yJ5YaN5riy5p+T44CCXG4gICAgICAvLyDnlKjlsZXlvIDogIzkuI3mmK8gYGJyZWFkY3J1bWJzOiBwYXlsb2FkLmJyZWFkY3J1bWJzID8/IG51bGxg77yaSnNvbj8g5YiX5LiN6IO955u05o6l5YaZIG51bGxcbiAgICAgIC8vIO+8iOexu+Wei+aYryBOdWxsYWJsZUpzb25OdWxsVmFsdWVJbnB1dCB8IElucHV0SnNvblZhbHVl77yM5LiUIFByaXNtYS5Kc29uTnVsbCDlrZjnmoTmmK9cbiAgICAgIC8vIEpTT04g55qEIG51bGzjgIFQcmlzbWEuRGJOdWxsIOaJjeaYryBTUUwgTlVMTO+8ieOAguWtl+auteaVtOS4quS4jeWHuueOsO+8jOivreS5ieacgOW5suWHgOOAglxuICAgICAgLi4uKHBheWxvYWQuYnJlYWRjcnVtYnNcbiAgICAgICAgPyB7IGJyZWFkY3J1bWJzOiBwYXlsb2FkLmJyZWFkY3J1bWJzIGFzIFByaXNtYS5JbnB1dEpzb25WYWx1ZSB9XG4gICAgICAgIDoge30pLFxuICAgIH07XG4gIH1cblxuICAvKipcbiAgICog5YiG6aG15p+l6K+i5byC5bi45LqL5Lu277yM5oyJ5LqL5Lu25pe26Ze05YCS5bqP44CCXG4gICAqXG4gICAqIOWTjeW6lOW9oueKtu+8iOWtl+autee7n+S4gCBzbmFrZV9jYXNl77yM5LiOIFNESyDkuIrmiqXlpZHnuqbjgIFpbmdlc3Qg5ZON5bqU5L+d5oyB5LiA6Ie077yJ77yaXG4gICAqIHtcbiAgICogICBpdGVtczogW3tcbiAgICogICAgIGV2ZW50X2lkLCBtZWNoYW5pc20sIHR5cGUsIG1lc3NhZ2UsIHN0YWNrLCBzb3VyY2UsXG4gICAqICAgICB0aW1lc3RhbXAsIHJlY2VpdmVkX2F0LCB1cmwsIHVzZXJfYWdlbnQsXG4gICAqICAgICBzZGtfbmFtZSwgc2RrX3ZlcnNpb24sXG4gICAqICAgICBleGNlcHRpb25fdHlwZSwgZXhjZXB0aW9uX3ZhbHVlLCBleGNlcHRpb25fbWVjaGFuaXNtLFxuICAgKiAgICAgc3RhY2t0cmFjZV9yYXcsIHN0YWNrdHJhY2VfZnJhbWVzLFxuICAgKiAgICAgdXNlcl9pZCwgc2Vzc2lvbl9pZCwgcmVsZWFzZSwgZW52aXJvbm1lbnQsXG4gICAqICAgICB0YWdzLCBleHRyYSwgYnJlYWRjcnVtYnMsXG4gICAqICAgfV0sXG4gICAqICAgdG90YWwsIHBhZ2UsIHBhZ2VTaXplLFxuICAgKiB9XG4gICAqXG4gICAqIOS4pOS4quWIu+aEj+eahOmAieaLqe+8mlxuICAgKiAgIOKRoCBvcmRlckJ5IOeUqCB0aW1lc3RhbXAg6ICM5LiN5pivIHJlY2VpdmVkX2F0IOKAlOKAlCDooajkuIrlj6rmnIlcbiAgICogICAgICBAQGluZGV4KFt0aW1lc3RhbXAoc29ydDogRGVzYyldKe+8jOaNouWtl+auteWwseaYr+WFqOihqCBzb3J0XG4gICAqICAg4pGhIOWIl+ihqOS4juaAu+aVsOaUvui/m+WQjOS4gOS4qiAkdHJhbnNhY3Rpb24g4oCU4oCUIOWQjOS4gOS6i+WKoeW/q+eFp++8jOW5tuWPkeWGmeWFpeaXtuS4jeS8mlxuICAgKiAgICAgIOWHuueOsFwidG90YWw9MTAg5L2G57+75Yiw56ysIDIg6aG15piv56m655qEXCLov5nnp43oh6rnm7jnn5vnm75cbiAgICpcbiAgICog6L+H5rih5o6l5Y+j77yaTTQtUzIg6LW3IHByb2plY3RJZCDlv4XloavvvIjmnaXoh6rmn6Xor6Llj4LmlbDvvIxTNCDlkI7mlLnnlLEgSldUIOWGs+Wumu+8ieOAglxuICAgKiDlj6bms6jvvJpjb3VudCgpIOWcqOWHoOWNgeS4h+ihjOaXtuaYr+WFqOihqOaJq+aPj++8jE0yIOS5i+WQjui2i+WKv+exu+afpeivouaUueivu+mihOiBmuWQiOihqOOAglxuICAgKi9cbiAgYXN5bmMgbGlzdEVycm9yRXZlbnRzKHByb2plY3RJZDogc3RyaW5nLCBwYWdlOiBudW1iZXIsIHBhZ2VTaXplOiBudW1iZXIpIHtcbiAgICBjb25zdCB3aGVyZSA9IHsgcHJvamVjdElkIH07XG4gICAgY29uc3QgW3Jvd3MsIHRvdGFsXSA9IGF3YWl0IHRoaXMucHJpc21hLiR0cmFuc2FjdGlvbihbXG4gICAgICB0aGlzLnByaXNtYS5lcnJvckV2ZW50LmZpbmRNYW55KHtcbiAgICAgICAgd2hlcmUsXG4gICAgICAgIG9yZGVyQnk6IHsgdGltZXN0YW1wOiAnZGVzYycgfSxcbiAgICAgICAgc2tpcDogKHBhZ2UgLSAxKSAqIHBhZ2VTaXplLFxuICAgICAgICB0YWtlOiBwYWdlU2l6ZSxcbiAgICAgIH0pLFxuICAgICAgdGhpcy5wcmlzbWEuZXJyb3JFdmVudC5jb3VudCh7IHdoZXJlIH0pLFxuICAgIF0pO1xuXG4gICAgcmV0dXJuIHtcbiAgICAgIGl0ZW1zOiByb3dzLm1hcCgocm93KSA9PiB0aGlzLnRvQXBpUm93KHJvdykpLFxuICAgICAgdG90YWwsXG4gICAgICBwYWdlLFxuICAgICAgcGFnZVNpemUsXG4gICAgfTtcbiAgfVxuXG4gIC8qKlxuICAgKiDmlbDmja7lupPooYwg4oaSIOaOpeWPo+WTjeW6lOOAglxuICAgKlxuICAgKiDkuLrku4DkuYjkuI3nm7TmjqUgcmV0dXJuIHJvd3PvvJpQcmlzbWEg6L+U5Zue55qE5piv5YaF6YOo5qih5Z6L5b2i54q277yM5Lul5ZCO57uZ6KGo5Yqg5LqG5LuF5L6bXG4gICAqIOWGhemDqOS9v+eUqOeahOWIl++8jOWug+S8muiHquWKqOWHuueOsOWcqOWTjeW6lOmHjOOAguWtl+auteWcqOi/memHjOaYvuW8j+WIl+WHuiA9IOaOpeWPo+Wlkee6pueUsei/memHjOWumuOAglxuICAgKlxuICAgKiDkuInlpITkuI3nlKjnibnmrorlpITnkIbvvJpcbiAgICogICDCtyBEYXRlIOe7jyBKU09OLnN0cmluZ2lmeSDoh6rliqjluo/liJfljJbmiJAgSVNPIDg2MDEgVVRDIOWtl+espuS4su+8iOespuWQiCBTUlMgwqc477yJXG4gICAqICAgwrcgSnNvbiDliJfnmoQgbnVsbCDkv53mjIEgbnVsbO+8jOS4jeS8muiiq+aKueaIkOe8uuWtl+autVxuICAgKiAgIMK3IOacrOihqOayoeaciSBCaWdJbnQg5YiX77yM5LiN5Lya6LipIEpTT04uc3RyaW5naWZ5IOS4jeaUr+aMgSBCaWdJbnQg55qE5Z2RXG4gICAqL1xuICBwcml2YXRlIHRvQXBpUm93KHJvdzogRXJyb3JFdmVudCkge1xuICAgIHJldHVybiB7XG4gICAgICBldmVudF9pZDogcm93LmV2ZW50SWQsXG4gICAgICBtZWNoYW5pc206IHJvdy5tZWNoYW5pc20sXG4gICAgICB0eXBlOiByb3cudHlwZSxcbiAgICAgIG1lc3NhZ2U6IHJvdy5tZXNzYWdlLFxuICAgICAgc3RhY2s6IHJvdy5zdGFjayxcbiAgICAgIHNvdXJjZTogcm93LnNvdXJjZSxcbiAgICAgIHRpbWVzdGFtcDogcm93LnRpbWVzdGFtcCxcbiAgICAgIHJlY2VpdmVkX2F0OiByb3cucmVjZWl2ZWRBdCxcbiAgICAgIHVybDogcm93LnVybCxcbiAgICAgIHVzZXJfYWdlbnQ6IHJvdy51c2VyQWdlbnQsXG4gICAgICBzZGtfbmFtZTogcm93LnNka05hbWUsXG4gICAgICBzZGtfdmVyc2lvbjogcm93LnNka1ZlcnNpb24sXG4gICAgICBleGNlcHRpb25fdHlwZTogcm93LmV4Y2VwdGlvblR5cGUsXG4gICAgICBleGNlcHRpb25fdmFsdWU6IHJvdy5leGNlcHRpb25WYWx1ZSxcbiAgICAgIGV4Y2VwdGlvbl9tZWNoYW5pc206IHJvdy5leGNlcHRpb25NZWNoYW5pc20sXG4gICAgICBzdGFja3RyYWNlX3Jhdzogcm93LnN0YWNrdHJhY2VSYXcsXG4gICAgICBzdGFja3RyYWNlX2ZyYW1lczogcm93LnN0YWNrdHJhY2VGcmFtZXMsXG4gICAgICB1c2VyX2lkOiByb3cudXNlcklkLFxuICAgICAgc2Vzc2lvbl9pZDogcm93LnNlc3Npb25JZCxcbiAgICAgIHJlbGVhc2U6IHJvdy5yZWxlYXNlLFxuICAgICAgZW52aXJvbm1lbnQ6IHJvdy5lbnZpcm9ubWVudCxcbiAgICAgIHRhZ3M6IHJvdy50YWdzLFxuICAgICAgZXh0cmE6IHJvdy5leHRyYSxcbiAgICAgIGJyZWFkY3J1bWJzOiByb3cuYnJlYWRjcnVtYnMsXG4gICAgICAvLy8g5b2S5bm25Yiw55qE6Zeu6aKYIElE77yMTlVMTCA9IOWwmuacquW9kuW5tu+8iE0xIOmYtuauteaBkuS4uiBOVUxM77yJ44CCXG4gICAgICAvLy8g55yL5p2/5ou/5a6D5aSa5pi+56S65LiA5YiX77yM5L2GKirpu5jorqTliJfooajkuI3lgZrku7vkvZXov4fmu6QqKiDigJTigJRcbiAgICAgIC8vLyDkuIDml6bmjIkgZ3JvdXBfaWQgSVMgTlVMTCDov4fmu6TvvIxXb3JrZXIg5b2S5bm25b6X6LaK5oiQ5Yqf44CB55yL5p2/5bCx6LaK56m644CCXG4gICAgICBncm91cF9pZDogcm93Lmdyb3VwSWQsXG4gICAgICAvLyBwcm9jZXNzZWRfYXQg5pyJ5oSP5LiN5pq06Zyy77ya5a6D5pivIFdvcmtlciDnmoTluYLnrYnpl7jpl6jvvIjlhoXpg6jov5vluqbvvInvvIxcbiAgICAgIC8vIOS4jeaYr+e7meeUqOaIt+eci+eahFwi5bey6K+7XCLmoIforrDjgILmmrTpnLLlroPnrYnkuo7orqnlpITnkIbov5vluqblhrPlrprnlKjmiLfog73nnIvliLDku4DkuYjjgIJcbiAgICB9O1xuICB9XG59XG4iXSwidmVyc2lvbiI6M30=
