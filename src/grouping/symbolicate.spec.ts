@@ -277,6 +277,18 @@ describe('符号化后的签名与 v2 指纹', () => {
     ).toBe('src/a.tsx:render');
   });
 
+  it('剥掉前导 ../：产物目录变深变浅都不影响指纹', () => {
+    // Vite 在 dist/assets 下会把源码记成 ../../src/App.tsx；
+    // 换一个更深的 outDir，前缀的 ../ 数量就变 —— 不剥就会换一批指纹
+    const shallow = symbolicatedSignature([symFrame({ source: '../../src/App.tsx' })]);
+    const deep = symbolicatedSignature([symFrame({ source: '../../../../src/App.tsx' })]);
+    const plain = symbolicatedSignature([symFrame({ source: 'src/App.tsx' })]);
+
+    expect(shallow).toBe('src/App.tsx:render');
+    expect(deep).toBe('src/App.tsx:render');
+    expect(plain).toBe('src/App.tsx:render');
+  });
+
   it('v2 指纹：64 位十六进制，且与 v1 同输入下的结果不同', () => {
     const message = 'Cannot read properties of undefined';
     const stack =
