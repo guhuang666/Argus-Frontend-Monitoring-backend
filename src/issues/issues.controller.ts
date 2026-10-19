@@ -1,4 +1,6 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Query } from '@nestjs/common';
+﻿import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Query, UseGuards } from '@nestjs/common';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { ProjectScopeGuard } from '../auth/project-scope.guard';
 import { PageQueryDto } from '../common/dto/page-query.dto';
 import { TenantQueryDto } from '../common/dto/tenant-query.dto';
 import { ListIssuesQueryDto } from './dto/list-issues-query.dto';
@@ -36,6 +38,7 @@ export class IssuesController {
    * 问题列表，按最近出现时间倒序。status 可选，不传 = 全部状态。
    */
   @Get()
+  @UseGuards(JwtAuthGuard, ProjectScopeGuard)
   list(@Query() query: ListIssuesQueryDto) {
     return this.service.listIssues(query);
   }
@@ -49,6 +52,7 @@ export class IssuesController {
    * 就能数出别人有几个问题。404 让"不存在"和"无权"不可区分。
    */
   @Get(':id')
+  @UseGuards(JwtAuthGuard, ProjectScopeGuard)
   detail(
     @Param('id', ParseUUIDPipe) id: string,
     @Query() tenant: TenantQueryDto,
@@ -65,6 +69,7 @@ export class IssuesController {
    * 返回 { issue, changed }，changed=false 表示状态本来就是这个值（幂等）。
    */
   @Patch(':id')
+  @UseGuards(JwtAuthGuard, ProjectScopeGuard)
   updateStatus(
     @Param('id', ParseUUIDPipe) id: string,
     @Query() tenant: TenantQueryDto,

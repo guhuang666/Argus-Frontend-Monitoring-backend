@@ -1,5 +1,7 @@
-import { Body, Controller, Get, Post, Query, Req } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Req, UseGuards } from '@nestjs/common';
 import type { Request } from 'express';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { ProjectScopeGuard } from '../auth/project-scope.guard';
 import { extractIngestKey } from '../common/ingest-key';
 import { TenantPageQueryDto } from '../common/dto/tenant-query.dto';
 import { KeysService } from '../keys/keys.service';
@@ -49,10 +51,14 @@ export class ErrorEventsController {
    * GET /api/v1/error?projectId=&page=&pageSize=
    * 分页查询异常事件，按事件时间倒序，返回 { items, total, page, pageSize }。
    *
+   * S4 起需要登录（JWT），且 projectId 必须属于你所在的某个组织。
+   * 两个守卫的分工见 auth/ 里的注释：前者认证（你是谁），后者授权（你能看哪个项目）。
+   *
    * 想看"归并后的结果"请用 GET /api/v1/issues —— 那是 M2 的问题列表；
    * 本接口的用途是"看原始事件明细"，也是问题详情页下钻的兜底。
    */
   @Get('error')
+  @UseGuards(JwtAuthGuard, ProjectScopeGuard)
   list(@Query() query: TenantPageQueryDto) {
     return this.service.listErrorEvents(query.projectId, query.page, query.pageSize);
   }

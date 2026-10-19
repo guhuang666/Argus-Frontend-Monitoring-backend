@@ -26,8 +26,60 @@ model Organization {
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   projects Project[]
+  /// 成员（M5-B）：**一个用户只属于一个组织**，关系做成 users.org_id 这一列。
+  /// 原先是 organization_members 多对多表，按「同一时刻能有几个」这条判据，
+  /// 答案是恰好 1，所以它是列不是表（迁移 20261020180000_one_org_per_user）。
+  users    User[]
 
   @@map("organizations")
+}
+
+/// 用户 —— 人类身份（不是机器身份）
+///
+/// 它与 ProjectKey 的分工，是整个鉴权模型的分水岭：
+///   ProjectKey  机器凭证：CI 上传 map、浏览器上报事件。无人值守，不能登录
+///   User        人类凭证：登进看板看数据。有密码、有会话、会过期
+/// 两类凭据不能互相代替 —— 私钥泄露不该让人登进看板，人登录也不该能上传 map。
+model User {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 登录名。用邮箱而不是用户名：以后要加"忘记密码"时不用再改表。
+  /// 统一转小写存储，否则 Alice@x.com 和 alice@x.com 会是两个账号
+  email String @unique @db.VarChar(255)
+
+  /// scrypt 派生的密码摘要，形如 scrypt$N$r$p$salt$hash。**永不存明文**
+  passwordHash String @map("password_hash") @db.VarChar(255)
+
+  displayName String? @map("display_name") @db.VarChar(100)
+
+  /// 所属组织。NOT NULL：一个用户必须属于且只属于一个组织。
+  ///
+  /// ── 为什么从多对多改成这一列 ────────────────────────────────────────────
+  /// 需求明确「一个用户只属于一个组织」。按判据「同一时刻能有几个」，
+  /// 答案是恰好 1 → 它是属性，不是实体。
+  /// 收益很具体：每次鉴权本来要 join 成员表才能知道"你能看哪些项目"，
+  /// 现在 JwtAuthGuard 查用户时顺手就拿到了 orgId，热路径零额外查询。
+  ///
+  /// 代价：以后确实要做"一个账号管多个组织"，得重新建关联表并回填。
+  /// 现在只有 1 个用户，是这次改动最便宜的时刻。
+  orgId String @map("org_id") @db.Uuid
+
+  /// owner / admin / member（FR-5.5）。用 varchar 而不是 enum：
+  /// 取值集合是产品语义，不是数据完整性约束
+  role String @default("member") @db.VarChar(20)
+
+  /// 停用账号用。删用户会连带删掉他的会话，但真删人之前通常先停用
+  isActive Boolean @default(true) @map("is_active")
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  /// 每次登录成功更新。用户自己能看到"上次登录时间"，异常时也是排查线索
+  lastLoginAt DateTime? @map("last_login_at") @db.Timestamptz
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  /// "这个组织里有谁"（将来做成员列表用），也是外键的反向关系
+  @@index([orgId])
+  @@map("users")
 }
 
 /// 项目 —— 上报的基本单位
@@ -51,6 +103,10 @@ model Project {
   /// 一个项目可以有多把钥匙（轮换 / 多环境）。见 ProjectKey 的注释
   keys               ProjectKey[]
 
+  /// 同组织内项目名不允许重复（MVP-B）。
+  /// 在数据库层拦而不是应用层"先查后插"：并发创建两个同名项目时，
+  /// 应用层的检查会同时通过，最后切换器里出现两个一模一样的条目 —— 人分不清。
+  @@unique([orgId, name])
   @@map("projects")
 }
 

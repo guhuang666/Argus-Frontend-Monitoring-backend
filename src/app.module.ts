@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { AuthModule } from './auth/auth.module';
 import { ErrorEventsModule } from './error-events/error-events.module';
 import { IssuesModule } from './issues/issues.module';
 import { KeysModule } from './keys/keys.module';
@@ -20,6 +21,9 @@ import { SourcemapsModule } from './sourcemaps/sourcemaps.module';
     PrismaModule,
     // 密钥解析（M4-S2）。@Global：上报/性能/上传/项目四处都要用。
     KeysModule,
+    // 人身份（M4-S4）。@Global：四个读接口模块的守卫都靠它实例化。
+    // 它只放 API 进程 —— worker 不鉴权，也不该有登录能力。
+    AuthModule,
     ErrorEventsModule,
     PerformanceModule,
     // 问题管理（M2 的读接口 + 状态流转）。

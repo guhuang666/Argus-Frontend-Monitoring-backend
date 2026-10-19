@@ -1,5 +1,7 @@
-import { Body, Controller, Get, Post, Query, Req } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Req, UseGuards } from '@nestjs/common';
 import type { Request } from 'express';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { ProjectScopeGuard } from '../auth/project-scope.guard';
 import { extractIngestKey } from '../common/ingest-key';
 import { TenantPageQueryDto } from '../common/dto/tenant-query.dto';
 import { KeysService } from '../keys/keys.service';
@@ -40,8 +42,11 @@ export class PerformanceController {
   /**
    * GET /api/v1/performance?projectId=&page=&pageSize=
    * 分页查询性能指标，按事件时间倒序，返回 { items, total, page, pageSize }。
+   *
+   * 与 GET /error 同样：S4 起需要登录 + 项目归属校验。
    */
   @Get('performance')
+  @UseGuards(JwtAuthGuard, ProjectScopeGuard)
   list(@Query() query: TenantPageQueryDto) {
     return this.service.listPerformanceMetrics(query.projectId, query.page, query.pageSize);
   }
