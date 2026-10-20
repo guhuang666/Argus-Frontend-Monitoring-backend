@@ -5,8 +5,8 @@
 // Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
 
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/prisma"
+  provider     = "prisma-client"
+  output       = "../generated/prisma"
   // NestJS 编译目标是 CommonJS（package.json 里没有 "type": "module"），
   // 而 prisma-client 生成器默认产 ESM 代码（用到 import.meta.url），
   // 二者不兼容会让 Node 加载编译产物时直接 SyntaxError。这里强制产 CJS。
@@ -15,21 +15,42 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  // 连接串写在 schema 里是 **Prisma 6 的写法**（Prisma 7 要求挪到 prisma.config.ts）。
+  // 本项目仍用 prisma@6.19.3，所以这行是对的。
+  // 如果编辑器给这行划红线并提示 "not supported in Prisma 7"，那是 Prisma 扩展
+  // 用了 v7 的语言服务器；在 .vscode/settings.json 里设 "prisma.pinToPrisma6": true 即可。
   url      = env("DATABASE_URL")
 }
-/// 组织 —— 租户链的根
-model Organization {
-  id           String   @id @default(uuid()) @db.Uuid
-  name         String   @db.VarChar(100)
-  slug         String   @unique @db.VarChar(100)
-  quotaMonthly BigInt?  @map("quota_monthly")
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
 
+/// 组织 —— 租户链的根
+///
+/// 层级：Organization → Project → (ErrorGroup / ErrorEvent / PerformanceMetric / Release)
+/// 所有业务数据都能顺着外键追到一个组织，所以它是"数据隔离"的最高边界。
+model Organization {
+  /// 主键。UUID 而不是自增整数 —— 自增会暴露"你是第几个客户"，也不能多库合并
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 组织显示名，如「某某科技」。**允许重名**（人类可读，不承担唯一性）
+  name String @db.VarChar(100)
+
+  /// 组织标识，URL 友好，如 acme。**全局唯一** —— 它才是外部引用组织的稳定锚点
+  slug String @unique @db.VarChar(100)
+
+  /// 月度配额上限（事件条数）。NULL = 不限量。
+  /// ⚠ 当前**没有任何代码读写这一列**，是为配额策略预留的；真正启用时要补计量与拦截
+  quotaMonthly BigInt? @map("quota_monthly")
+
+  /// 创建时间。服务端时钟，不是客户端上报的时间
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  /// 组织下的项目（反向关系）
   projects Project[]
-  /// 成员（M5-B）：**一个用户只属于一个组织**，关系做成 users.org_id 这一列。
+
+  /// 组织成员（反向关系）
+  /// **一个用户只属于一个组织**，关系落在 users.org_id 这一列上，没有中间表。
   /// 原先是 organization_members 多对多表，按「同一时刻能有几个」这条判据，
   /// 答案是恰好 1，所以它是列不是表（迁移 20261020180000_one_org_per_user）。
-  users    User[]
+  users User[]
 
   @@map("organizations")
 }
@@ -41,15 +62,18 @@ model Organization {
 ///   User        人类凭证：登进看板看数据。有密码、有会话、会过期
 /// 两类凭据不能互相代替 —— 私钥泄露不该让人登进看板，人登录也不该能上传 map。
 model User {
+  /// 主键。用 UUID 而不是邮箱当主键：邮箱可以改，主键不该改
   id String @id @default(uuid()) @db.Uuid
 
   /// 登录名。用邮箱而不是用户名：以后要加"忘记密码"时不用再改表。
-  /// 统一转小写存储，否则 Alice@x.com 和 alice@x.com 会是两个账号
+  /// **全局唯一**且统一转小写存储，否则 Alice@x.com 和 alice@x.com 会是两个账号
   email String @unique @db.VarChar(255)
 
   /// scrypt 派生的密码摘要，形如 scrypt$N$r$p$salt$hash。**永不存明文**
   passwordHash String @map("password_hash") @db.VarChar(255)
 
+  /// 界面上显示的名字（昵称）。可空：注册时没填就留 NULL，
+  /// 空串会被 auth.service 归一成 NULL，避免界面出现一行空白欢迎语
   displayName String? @map("display_name") @db.VarChar(100)
 
   /// 所属组织。NOT NULL：一个用户必须属于且只属于一个组织。
@@ -71,10 +95,13 @@ model User {
   /// 停用账号用。删用户会连带删掉他的会话，但真删人之前通常先停用
   isActive Boolean @default(true) @map("is_active")
 
-  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  /// 注册时间。服务端时钟
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
   /// 每次登录成功更新。用户自己能看到"上次登录时间"，异常时也是排查线索
   lastLoginAt DateTime? @map("last_login_at") @db.Timestamptz
 
+  /// 所属组织（外键）。onDelete: Cascade —— 组织没了，成员关系也没有意义
   organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   /// "这个组织里有谁"（将来做成员列表用），也是外键的反向关系
@@ -83,22 +110,47 @@ model User {
 }
 
 /// 项目 —— 上报的基本单位
+///
+/// 一条事件的 project_id 决定它归到哪个项目，进而决定看板上谁看得见它。
+/// 项目的名字在同一组织内唯一，跨组织可以重名（不同客户各有一个「官网」很正常）。
 model Project {
-  id              String   @id @default(uuid()) @db.Uuid
-  orgId           String   @map("org_id") @db.Uuid
-  name            String   @db.VarChar(100)
-  platform        String   @default("browser") @db.VarChar(20)
-  sampleRate      Decimal  @default(1.00) @map("sample_rate") @db.Decimal(3, 2)
-  rateLimitPerSec Int      @default(100) @map("rate_limit_per_sec")
-  isActive        Boolean  @default(true) @map("is_active")
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  /// 主键。SDK 上报时靠 project_keys 反查到它，再写进各业务表的 project_id
+  id String @id @default(uuid()) @db.Uuid
 
+  /// 所属组织。NOT NULL：项目必须挂在某个组织下，否则鉴权时无法判定归属
+  orgId String @map("org_id") @db.Uuid
+
+  /// 项目显示名，如「官网前端」。同组织内不允许重名（见文件末尾的 @@unique）
+  name String @db.VarChar(100)
+
+  /// 平台类型，默认 browser。当前只有浏览器 SDK，留着这一列是为了以后接小程序/Node
+  platform String @default("browser") @db.VarChar(20)
+
+  /// 采样率（0.00 ~ 1.00），默认 1.00 即全量上报。
+  /// Decimal(3,2) 而不是 float：采样率要做乘法判断，不能有浮点误差。
+  /// ⚠ 当前只在项目配置接口里读出返回，**尚未在接入链路按它丢弃事件**
+  sampleRate Decimal @default(1.00) @map("sample_rate") @db.Decimal(3, 2)
+
+  /// 每秒允许的上报条数上限，默认 100。
+  /// ⚠ 同上：目前只读不生效，限流属于后续里程碑
+  rateLimitPerSec Int @default(100) @map("rate_limit_per_sec")
+
+  /// 项目开关。停用后应当拒收上报（当前由密钥校验链路决定，未读这一列）
+  isActive Boolean @default(true) @map("is_active")
+
+  /// 创建时间。服务端时钟
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  /// 所属组织（外键）。Cascade：删组织连带删项目
   organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
-  /// 反向关系（S0 多租户）：四张业务表都以 project_id 归属
+  /// 反向关系：本项目的归并结果（问题）。S0 多租户起，四张业务表都以 project_id 归属
   errorGroups        ErrorGroup[]
+  /// 反向关系：本项目的异常事件明细
   errorEvents        ErrorEvent[]
+  /// 反向关系：本项目的性能指标明细
   performanceMetrics PerformanceMetric[]
+  /// 反向关系：本项目已上传 map 的发布版本（M3 符号化按它匹配）
   releases           Release[]
   /// 一个项目可以有多把钥匙（轮换 / 多环境）。见 ProjectKey 的注释
   keys               ProjectKey[]
@@ -120,9 +172,12 @@ model Project {
 ///   · publicKey     只授权"往这一个项目写事件"，明文存储（要展示给用户）
 ///   · secretKeyHash 授权"管理这一个项目"（上传 Sourcemap、改配置），只存哈希
 model ProjectKey {
+  /// 主键。一把钥匙一行，便于单独吊销与轮换
   id String @id @default(uuid()) @db.Uuid
 
+  /// 所属项目。NOT NULL —— 一把钥匙必须且只能属于一个项目
   projectId String  @map("project_id") @db.Uuid
+  /// 所属项目（外键）。Cascade：删项目连带删掉它的所有钥匙
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   /// 公钥，形如 argus_pub_<32hex>。明文存：要在设置页展示、复制到 SDK
@@ -142,8 +197,10 @@ model ProjectKey {
   /// NULL = 有效；有值 = 从该时刻起失效（设成未来时间即宽限期）
   revokedAt DateTime? @map("revoked_at") @db.Timestamptz
 
+  /// 创建时间。服务端时钟，排查"哪把钥匙什么时候发的"
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
 
+  /// "这个项目有哪些钥匙"（设置页列表），也是外键的索引
   @@index([projectId])
   @@map("project_keys")
 }
@@ -154,46 +211,46 @@ model ProjectKey {
 /// （比如以后的后台任务或数据修复脚本可能绕过 DTO 直接写库）。
 /// 每个值写了 @map，保证数据库里存的仍是原始的连字符文本，与原 Mongo 数据一致。
 enum Mechanism {
-  onerror             @map("onerror")
-  unhandledrejection  @map("unhandledrejection")
-  resource            @map("resource")
+  /// window.onerror 捕获的运行时同步异常
+  onerror            @map("onerror")
+  /// unhandledrejection 捕获的未处理 Promise 拒绝
+  unhandledrejection @map("unhandledrejection")
+  /// 资源加载失败（img / script / link）。该通道**没有 Error 对象也没有堆栈**
+  resource           @map("resource")
 
   @@map("error_mechanism")
 }
 
 /// 问题 —— 归并后的实体，按 SRS §7.1 建，M2 的产物
 ///
-/// 唯一约束把 grouping_version 也算进去，这是 v1.1 的关键决策：
-/// 同一个错误在 v1-raw（未符号化）与 v2-symbolicated（已还原源码）两套指纹下
-/// 可以同时存在、互不覆盖 —— M3 做受控重算时，历史 times_seen 才不会断档
+/// 唯一约束 (project_id, grouping_version, fingerprint) 把 grouping_version 也算进去，
+/// 这是 v1.1 的关键决策：同一个错误在 v1-raw（未符号化）与 v2-symbolicated（已还原源码）
+/// 两套指纹下可以同时存在、互不覆盖 —— M3 做受控重算时，历史 times_seen 才不会断档
 /// （FR-4.12 / FR-4.13）。
 ///
-/// ⚠ MVP 阶段去掉了 project_id（单项目模式）—— 唯一约束从
-/// (project_id, grouping_version, fingerprint) 收窄为
-/// (grouping_version, fingerprint)，作用域由"项目内"变成"全局"。
-///
-/// 加回多项目时注意：project_id **必须 NOT NULL**。Postgres 的唯一索引把 NULL
-/// 视为互不相同，一旦 project_id 可空，三元组约束就形同虚设 —— 同一指纹能插进
-/// 任意多行 NULL，upsert 永远走 create，一个 bug 炸 1000 次就是 1000 行问题，
-/// 而且一句错都不报。
+/// ⚠ project_id **必须 NOT NULL**：Postgres 的唯一索引把 NULL 视为互不相同，
+/// 一旦它可空，三元组约束就形同虚设 —— 同一指纹能插进任意多行 NULL，upsert 永远走
+/// create，一个 bug 炸 1000 次就是 1000 行问题，而且一句错都不报。
 model ErrorGroup {
+  /// 主键。事件的 group_id 指向它，把它和明细关联起来
   id String @id @default(uuid()) @db.Uuid
 
-  /// 所属项目（S0 多租户）。
-  ///
-  /// **必须 NOT NULL**：Postgres 的唯一索引把 NULL 视为互不相同，一旦可空，
-  /// (project_id, grouping_version, fingerprint) 三元组就形同虚设 —— 同一指纹
-  /// 能插进任意多行 NULL，upsert 永远走 create，一个 bug 炸 1000 次就是 1000 行问题。
-  projectId String  @map("project_id") @db.Uuid
-  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// 所属项目（S0 多租户）。为什么必须 NOT NULL 见模型顶部注释
+  projectId String @map("project_id") @db.Uuid
 
-  /// 指纹哈希
+  /// 所属项目（外键）。Cascade：删项目连带删掉归并结果
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// 指纹哈希：sha256(type | 归一化 message | 帧签名)，64 位十六进制。
+  /// 同一个指纹 = 同一个问题。算法在 src/grouping/fingerprint.ts
   fingerprint String @db.VarChar(64)
 
-  /// 指纹算法及其输入的版本：v1-raw / v2-symbolicated，见 FR-4.12
+  /// 指纹算法及其输入的版本：v1-raw / v2-symbolicated，见 FR-4.12。
+  /// 改了指纹逻辑必须 bump 它，否则新旧两套指纹混在同一个 version 里，归并会静默漂移
   groupingVersion String @map("grouping_version") @db.VarChar(20)
 
-  /// 归一化后的标题
+  /// 归一化后的标题，形如 `TypeError: Failed to fetch user <uuid> after <number>ms`。
+  /// 看板列表里显示的就是它；因为走的是归一化后的 message，跨多次发生才稳定
   title String @db.VarChar(500)
 
   /// 疑似责任位置，如 checkout.9f2c.js:renderSummary。
@@ -201,30 +258,43 @@ model ErrorGroup {
   culprit String? @db.VarChar(500)
 
   /// fatal / error / warning / info —— 按 SRS 用 varchar 而非 enum：
-  /// 取值集合是产品语义，不是数据完整性约束，用 enum 每次加值都要迁移
+  /// 取值集合是产品语义，不是数据完整性约束，用 enum 每次加值都要迁移。
+  /// ⚠ 当前 Worker 不推断级别，全部落默认值 error
   level String @default("error") @db.VarChar(20)
 
-  /// unresolved / resolved / ignored / archived
+  /// 状态机：unresolved / resolved / ignored / archived（FR-4.8）。
+  /// 由 PATCH /api/v1/issues/:id 改动；已解决的若又收到新事件会被 Worker 自动打回 unresolved
   status String @default("unresolved") @db.VarChar(20)
 
-  /// 累计发生次数 / 累计影响用户数。NOT NULL 列必须有初值，给 0
+  /// 累计发生次数。每次归并命中同一问题就 +1（用原子 increment，不能读改写）。
+  /// BigInt：单条错误在长期存活的项目里可能过亿次。
+  /// ⚠ 序列化成 JSON 时必须转 Number，否则 JSON.stringify 会抛 TypeError
   timesSeen BigInt @default(0) @map("times_seen")
+
+  /// 累计影响用户数。**当前恒为 0**：上报链路还没有 user_id 的去重统计机制
   usersSeen BigInt @default(0) @map("users_seen")
 
+  /// 首次出现时间：取第一条事件的客户端时间，之后**不再更新**。
+  /// 乱序补报的旧事件不会把它往前挪（这是 MVP 主动接受的近似）
   firstSeen DateTime @map("first_seen") @db.Timestamptz
-  lastSeen  DateTime @map("last_seen") @db.Timestamptz
 
-  /// 首次 / 最近出现的版本。可空：M1 的 SDK 还不上报 release，
+  /// 最近出现时间：每来一条事件就更新。看板列表默认按它倒序（有索引）
+  lastSeen DateTime @map("last_seen") @db.Timestamptz
+
+  /// 首次出现时的 release 版本。可空：SDK 可以不上报 release，
   /// 硬塞空串会让"没带版本"和"版本是空"混在一起
   firstRelease String? @map("first_release") @db.VarChar(100)
-  lastRelease  String? @map("last_release") @db.VarChar(100)
 
-  /// 解决时间，NULL 表示尚未解决（对齐 project_keys.revoked_at 的写法）
+  /// 最近出现时的 release 版本。可空，理由同上
+  lastRelease String? @map("last_release") @db.VarChar(100)
+
+  /// 解决时间，NULL 表示尚未解决。只在进入 resolved 时打点、离开时清空
   resolvedAt DateTime? @map("resolved_at") @db.Timestamptz
 
   /// 反向关系：归并到本问题下的事件明细
   events ErrorEvent[]
 
+  /// 归并的落点：同一项目 + 同一分组版本 + 同一指纹，只能有一行
   @@unique([projectId, groupingVersion, fingerprint])
   /// 索引一律以 project_id 打头 —— TC-08 要求每次查询都带 projectId，
   /// 索引不以它打头就用不上（SRS §7.1 就是这么定的）
@@ -242,70 +312,103 @@ model ErrorEvent {
   /// 用 VarChar 而非 Uuid：DTO 只校验长度（1~128），SDK 发什么形状都收得下
   eventId String @id @map("event_id") @db.VarChar(128)
 
-  /// 所属项目（S0 多租户）。NOT NULL，理由同 ErrorGroup。
-  projectId String  @map("project_id") @db.Uuid
-  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// 所属项目（S0 多租户）。NOT NULL：不知道归属的落库事件无法做鉴权隔离
+  projectId String @map("project_id") @db.Uuid
+
+  /// 所属项目（外键）。Cascade：删项目连带删明细
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   /// 采集通道（对应 Mongoose 的 enum 约束）
   mechanism Mechanism
 
-  /// Error.name，如 TypeError
+  /// Error.name，如 TypeError；resource 通道里是标签名（img / script / link）
   type String @db.VarChar(128)
 
-  /// 未归一化的原始 message
+  /// 未归一化的原始 message。**永远保持原文**：归一化只在算指纹那一刻发生，
+  /// 回写覆盖会导致指纹输入无法从原始数据重建（TC-10）
   message String @db.VarChar(2000)
 
-  /// 整段 stack 原文
+  /// 整段 stack 原文。归并时从这里解析帧，解析结果的冗余副本在 stacktrace_raw
   stack String? @db.Text
 
-  /// 出错位置 app.js:12:34；Promise 通道为空
+  /// 出错位置，形如 app.js:12:34（= stack 第一帧的位置 + 行列号）。
+  /// Promise 通道拿不到，为空；resource 通道放的是失败资源的 URL
   source String? @db.VarChar(512)
 
-  /// 事件发生时间（客户端时钟）
+  /// 事件发生时间（客户端时钟）。客户端时钟不可靠，排序/统计时注意这一点
   timestamp DateTime @db.Timestamptz
 
-  /// 服务端接收时间（原 Mongoose 的 created_at，由 timestamps 自动写入）
+  /// 服务端接收时间（原 Mongoose 的 created_at，由 timestamps 自动写入）。
+  /// 和 timestamp 的差值是"上报延迟"，排查离线补报时有用
   receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz
 
-  url       String @db.VarChar(2048)
+  /// 出错页面的完整 URL（含 query/hash）。写入侧不归一化 —— 见上面 message 的理由
+  url String @db.VarChar(2048)
+
+  /// 浏览器 User-Agent 原文。区分"只在这一个浏览器上炸"时靠它
   userAgent String @map("user_agent") @db.VarChar(512)
 
-  /// 原 Mongo 的嵌套 sdk: { name, version }，拍平成两列
-  sdkName    String? @map("sdk_name") @db.VarChar(64)
+  /// SDK 名称，原 Mongo 的嵌套 sdk.name 拍平而来
+  sdkName String? @map("sdk_name") @db.VarChar(64)
+
+  /// SDK 版本，原 Mongo 的嵌套 sdk.version 拍平而来
   sdkVersion String? @map("sdk_version") @db.VarChar(32)
 
-  /// 原 Mongo 的嵌套 exception: { type, value, mechanism, stacktrace: { raw, frames } }
-  /// frames 用 Json 承载：SDK 目前只发 stack 原文，该数组由后端解析后回填
-  exceptionType      String? @map("exception_type") @db.VarChar(128)
-  exceptionValue     String? @map("exception_value") @db.VarChar(2000)
-  exceptionMechanism String? @map("exception_mechanism") @db.VarChar(20)
-  stacktraceRaw      String? @map("stacktrace_raw") @db.Text
-  stacktraceFrames   Json?   @map("stacktrace_frames")
+  /// ⚠ 冗余列：与上面的 type 完全相同（toRow 里直接复制）。
+  /// 保留是为了兼容 Mongoose 时代的嵌套 exception 形状；**归并只用上面的 type**
+  exceptionType String? @map("exception_type") @db.VarChar(128)
 
-  /// 原 Mongo 的嵌套 user: { id } / session: { id }，只留 ID
-  userId    String? @map("user_id") @db.VarChar(100)
+  /// ⚠ 冗余列：与 message 完全相同。归并只用上面的 message
+  exceptionValue String? @map("exception_value") @db.VarChar(2000)
+
+  /// ⚠ 冗余列：与 mechanism 相同，但类型是 varchar 而非 enum
+  exceptionMechanism String? @map("exception_mechanism") @db.VarChar(20)
+
+  /// ⚠ 冗余列：与 stack 完全相同
+  stacktraceRaw String? @map("stacktrace_raw") @db.Text
+
+  /// 由后端 parseFrames() 解析出的帧数组，形如 [{ file, fn }]。
+  /// 指纹只用前 3 帧，但这里存**全部帧**（排查要能看全栈）。
+  /// 没有堆栈的通道（resource）保持 NULL，而不是存空数组 —— "没解析"和"解析出 0 帧"是两件事
+  stacktraceFrames Json? @map("stacktrace_frames")
+
+  /// 受影响用户 ID（原 Mongo 的嵌套 user.id）。可空，SDK 未接入前恒为 NULL
+  userId String? @map("user_id") @db.VarChar(100)
+
+  /// 会话 ID（原 Mongo 的嵌套 session.id）。可空，同上
   sessionId String? @map("session_id") @db.VarChar(100)
 
-  release     String? @db.VarChar(100)
+  /// 客户端上报的版本号。与 releases.version 是**逻辑关联，不是外键** ——
+  /// 版本可能还没登记（先上线、后补传 map），硬加外键会让这种事件写不进去
+  release String? @db.VarChar(100)
+
+  /// 环境标识，如 production / staging。可空
   environment String? @db.VarChar(50)
 
-  /// 原 Mongo 的 Object 类型字段。用 Json 不用 Jsonb：形状由 SDK 决定，写入侧不解释
+  /// 自定义标签（JSON 对象）。形状由 SDK 决定，写入侧不解释
   tags Json?
+
+  /// 自定义附加数据（JSON 对象）。同上
   extra Json?
+
   /// 面包屑原样落库，读取侧（看板时间线 FR-8.6）再渲染
   breadcrumbs Json?
 
-  /* —— 归并相关（W1 新增，M2 使用）—— */
+  /**
+   * —— 归并相关（W1 新增，M2 使用）——
+   */
 
-  /// 指向归并后的问题。NULL = 尚未归并（M1 阶段全部为 NULL）。
+  /// 指向归并后的问题。NULL = 尚未归并
   ///
   /// onDelete: SetNull 而不是 Cascade —— 删掉一个问题不该连带删掉事件明细：
   /// 明细是"到底发生了什么"的唯一真相，问题只是它的一种聚合视图。
-  groupId String?     @map("group_id") @db.Uuid
-  group   ErrorGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  groupId String? @map("group_id") @db.Uuid
+
+  /// 指向归并后的问题（外键）。SetNull 的理由见上面 groupId
+  group ErrorGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
   /// Worker 幂等闸门：NULL = 尚未处理。
-  /// Worker 取到一批事件后先原子置位本列（UPDATE ... WHERE processed_at IS NULL），
+  /// Worker 取到一条事件后先原子置位本列（UPDATE ... WHERE processed_at IS NULL），
   /// 抢到的那次才去做归并 —— 保证同一条事件被重复消费时不会被归并两次。
   /// 注意：这是**内部字段**，不是给用户看的"已读"标记，不要拿它过滤读接口。
   processedAt DateTime? @map("processed_at") @db.Timestamptz
@@ -322,9 +425,11 @@ model PerformanceMetric {
   /// SDK 生成的事件唯一 ID，用于 keepalive 重复投递时的去重
   eventId String @id @map("event_id") @db.VarChar(128)
 
-  /// 所属项目（S0 多租户）。NOT NULL，理由同 ErrorGroup。
-  projectId String  @map("project_id") @db.Uuid
-  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// 所属项目（S0 多租户）。NOT NULL：性能数据的鉴权隔离全靠它
+  projectId String @map("project_id") @db.Uuid
+
+  /// 所属项目（外键）。Cascade：删项目连带删明细
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   /// 页面加载完成的时刻（客户端时钟）
   timestamp DateTime @db.Timestamptz
@@ -334,43 +439,63 @@ model PerformanceMetric {
 
   /// 计入指标的页面地址。存完整 URL（含 query 和 hash）不做归一化 ——
   /// 与 TC-10 同一条纪律：归一化是读取侧算排行时的动作，写入侧剥掉就还原不回来了
-  url       String @db.VarChar(2048)
+  url String @db.VarChar(2048)
+
+  /// 浏览器 User-Agent 原文。设备维度分析靠它
   userAgent String @map("user_agent") @db.VarChar(512)
 
-  /// 原 Mongo 的嵌套 sdk: { name, version }
-  sdkName    String? @map("sdk_name") @db.VarChar(64)
+  /// SDK 名称（原 Mongo 的嵌套 sdk.name）
+  sdkName String? @map("sdk_name") @db.VarChar(64)
+
+  /// SDK 版本（原 Mongo 的嵌套 sdk.version）
   sdkVersion String? @map("sdk_version") @db.VarChar(32)
 
   /// 三个 Core Web Vitals。全部可空：**「没测到」和「测得 0」是两件事** ——
   /// 用 0 兜底会让看板把"没数据"和"性能完美"混在一起。
   /// 类型用双精度浮点而非 Decimal：这是测量值不是金额，分位数计算也更省
   lcp Float? @db.DoublePrecision
+
+  /// 累积布局偏移（无单位，越小越好）。可空理由见 lcp
   cls Float? @db.DoublePrecision
+
+  /// 交互到下次绘制的延迟（毫秒，越小越好）。可空理由见 lcp
   inp Float? @db.DoublePrecision
 
-  /// 归因：光有数字没法优化，必须知道是谁拖慢的
+  /// LCP 对应的元素选择器，如 img.hero。回答"是哪张图慢"
   lcpElement String? @map("lcp_element") @db.VarChar(32)
-  inpTarget  String? @map("inp_target") @db.VarChar(32)
+
+  /// INP 对应的交互目标元素，如 button#submit。回答"点哪个按钮卡"
+  inpTarget String? @map("inp_target") @db.VarChar(32)
+
+  /// 触发 INP 的元素名（比 inpTarget 更细的来源标签）
   inpElement String? @map("inp_element") @db.VarChar(32)
-  /// input-delay / processing / presentation
-  inpPhase   String? @map("inp_phase") @db.VarChar(32)
+
+  /// INP 的耗时阶段：input-delay / processing / presentation
+  inpPhase String? @map("inp_phase") @db.VarChar(32)
 
   /// navigate / reload / back_forward。必须存：刷新和返回时 LCP 天然更差，
   /// 不看这个维度会出现大量"假警报"
   navigationType String? @map("navigation_type") @db.VarChar(32)
 
-  /// 原 Mongo 的嵌套 device: { viewport, dpr }
+  /// 视口尺寸，形如 1920x1080（原 Mongo 的嵌套 device.viewport）
   deviceViewport String? @map("device_viewport") @db.VarChar(32)
-  deviceDpr      Float?  @map("device_dpr") @db.DoublePrecision
 
-  /// 网络类型（effectiveType），只有 Chrome 系能拿到，其余为 null
+  /// 设备像素比，如 2（原 Mongo 的嵌套 device.dpr）。高分屏对性能影响很大
+  deviceDpr Float? @map("device_dpr") @db.DoublePrecision
+
+  /// 网络类型（effectiveType，如 4g / 3g），只有 Chrome 系能拿到，其余为 null
   connection String? @db.VarChar(16)
 
-  /// 原 Mongo 的嵌套 user: { id } / session: { id }
-  userId    String? @map("user_id") @db.VarChar(100)
+  /// 受影响用户 ID（原 Mongo 的嵌套 user.id）。可空
+  userId String? @map("user_id") @db.VarChar(100)
+
+  /// 会话 ID（原 Mongo 的嵌套 session.id）。可空
   sessionId String? @map("session_id") @db.VarChar(100)
 
-  release     String? @db.VarChar(100)
+  /// 客户端上报的版本号。可空，与 releases 是逻辑关联
+  release String? @db.VarChar(100)
+
+  /// 环境标识，如 production / staging。可空
   environment String? @db.VarChar(50)
 
   /// 看板 90% 的查询是「某项目某页面某时间段的指标趋势」和「最近 N 条」，
@@ -386,16 +511,16 @@ model PerformanceMetric {
 /// 客户端报上来的版本号可能还没登记（先上线、后补传 map），硬加外键会让这种事件
 /// 直接写不进去 —— 丢一条错误比丢一次 map 匹配严重得多。所以两边都只存字符串，
 /// 由 Worker 在符号化时按 (version, artifact_path) 现查。
-///
-/// ⚠ MVP 阶段同样去掉了 project_id（与 ErrorGroup 同一条理由，见其注释）。
-/// 加回多项目时 project_id **必须 NOT NULL**，否则会精确复现 schema.prisma 里
-/// ErrorGroup 那段记的坑：唯一索引把 NULL 视为互不相同，同一个版本能插进任意多行。
 model Release {
+  /// 主键。sourcemap_files.release_id 指向它
   id String @id @default(uuid()) @db.Uuid
 
-  /// 所属项目（S0 多租户）。NOT NULL，理由同 ErrorGroup。
-  projectId String  @map("project_id") @db.Uuid
-  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// 所属项目（S0 多租户）。NOT NULL，理由同 ErrorGroup：
+  /// 可空会让唯一索引失效，同一个版本号能插进任意多行
+  projectId String @map("project_id") @db.Uuid
+
+  /// 所属项目（外键）。Cascade：删项目连带删版本与它的 map 记录
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   /// 版本号，如 web@1.2.4。**必须与 SDK initArgus({release}) 上报的字符串逐字节一致**，
   /// 这是 Worker 从 error_events.release 查到本行的唯一依据。
@@ -403,8 +528,10 @@ model Release {
   /// 唯一性从 `version` 收窄为 **(projectId, version)**：不同项目可以用同一个版本号
   version String @db.VarChar(100)
 
+  /// 创建时间（= 第一次上传该版本 map 的时间）
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
 
+  /// 反向关系：这个版本下已上传的产物 → map 映射
   sourcemapFiles SourcemapFile[]
 
   @@unique([projectId, version])
@@ -417,7 +544,10 @@ model Release {
 /// Worker 拿到一帧的 filename，剥掉 origin / query / :line:col 之后按这对键查。
 /// 这就是 FR-3.4「按 release 匹配 Sourcemap」在数据层的落地形式。
 model SourcemapFile {
-  id        String @id @default(uuid()) @db.Uuid
+  /// 主键。对外不暴露，查找一律走 (release_id, artifact_path)
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 所属版本。Not NULL —— 一份 map 不挂在版本上就无从匹配
   releaseId String @map("release_id") @db.Uuid
 
   /// 产物路径，**统一存以 / 开头的 pathname**：/assets/index-a1b2c3.js
@@ -433,11 +563,15 @@ model SourcemapFile {
   /// map 不进 DB：单个动辄几 MB，塞进行里会让每次查询都背着它
   sourcemapPath String @map("sourcemap_path") @db.VarChar(500)
 
+  /// map 文件的字节数。BigInt 是为了和"大文件"的直觉对齐，实际几 MB 就够 Int。
+  /// ⚠ 序列化时必须转 Number
   sizeBytes BigInt @map("size_bytes")
 
+  /// 首次上传该 map 的时间。重传覆盖时不更新（它记录的是"什么时候有的"）
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
 
-  /// Cascade：FR-3.10 要能整体清掉过期 release 的 map，删版本时不该留下孤儿行
+  /// 所属版本（外键）。Cascade：FR-3.10 要能整体清掉过期 release 的 map，
+  /// 删版本时不该留下孤儿行
   release Release @relation(fields: [releaseId], references: [id], onDelete: Cascade)
 
   /// 幂等重传靠它做 upsert：同版本同路径再次上传 = 覆盖，不新增行（FR-3.3）

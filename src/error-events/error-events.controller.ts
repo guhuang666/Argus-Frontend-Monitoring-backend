@@ -1,10 +1,10 @@
-import { Body, Controller, Get, Post, Query, Req, UseGuards } from '@nestjs/common';
-import type { Request } from 'express';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ProjectScopeGuard } from '../auth/project-scope.guard';
-import { extractIngestKey } from '../common/ingest-key';
 import { TenantPageQueryDto } from '../common/dto/tenant-query.dto';
-import { KeysService } from '../keys/keys.service';
+import { IngestProject } from '../ratelimit/ingest-context';
+import type { IngestContext } from '../ratelimit/ingest-context';
+import { IngestRateLimitGuard } from '../ratelimit/ingest-rate-limit.guard';
 import { IngestErrorDto } from './dto/ingest-error.dto';
 import { ErrorEventsService } from './error-events.service';
 // interface 只用于类型，在装饰器签名里必须用 import type，
@@ -15,7 +15,7 @@ import type { IngestResult } from './error-events.service';
  * 异常事件：上报 + 查询。
  *
  * 同一资源同一路径，靠 HTTP 方法区分动作：
- *   POST /api/v1/error   上报一条（公钥鉴权：X-Argus-Key 或 ?key=）
+ *   POST /api/v1/error   上报一条（公钥鉴权：请求头 X-Argus-Key）
  *   GET  /api/v1/error?projectId=...  分页查询（管理侧，S4 起改挂 JWT）
  *
  * `api/v1` 统一放在 @Controller 前缀上，路由字符串里不再重复写 v1 ——
@@ -23,28 +23,31 @@ import type { IngestResult } from './error-events.service';
  */
 @Controller('api/v1')
 export class ErrorEventsController {
-  constructor(
-    private readonly service: ErrorEventsService,
-    private readonly keys: KeysService,
-  ) {}
+  constructor(private readonly service: ErrorEventsService) {}
 
   /**
    * POST /api/v1/error
    *
-   * ── 鉴权顺序：先认钥匙，再校验字段体 ────────────────────────────────────
-   * ValidationPipe 是对 @Body 生效的，会先于方法体执行 —— 也就是说"格式不合法的
-   * 未鉴权请求"会先拿到 400 而不是 401。这个顺序是有意的（便宜的事先做），
-   * 但它确实泄漏了"这条路由接受什么形状"，对上报接口无所谓。
+   * ── 鉴权 + 限流都在守卫里 ──────────────────────────────────────────────
+   * `IngestRateLimitGuard` 做三件事：
+   *   ① 解析公钥 → projectId（同时取出该项目的每秒上限）
+   *   ② 滑动窗口检查（Redis + Lua），超了回 429 + `Retry-After`
+   *   ③ 把结果挂到 request 上，控制器用 `@IngestProject()` 取
    *
-   * ── projectId 不再由 DTO 决定 ──────────────────────────────────────────
+   * 所以方法体里不再有"这是哪个项目"的逻辑 —— 它已经被守卫确定下来了。
+   *
+   * ── projectId 不由 DTO 决定 ────────────────────────────────────────────
    * 客户端发的任何 project_id 字段都不会被采信：项目身份只来自钥匙。
    * 这是 TC-05 的核心 —— 隔离由数据访问层强制的 projectId 决定，
    * 而不是由"请求里带了什么"决定。
    */
   @Post('error')
-  async store(@Body() body: IngestErrorDto, @Req() req: Request): Promise<IngestResult> {
-    const projectId = await this.keys.resolveProjectByPublicKey(extractIngestKey(req));
-    return this.service.ingest(body, projectId);
+  @UseGuards(IngestRateLimitGuard)
+  async store(
+    @Body() body: IngestErrorDto,
+    @IngestProject() project: IngestContext,
+  ): Promise<IngestResult> {
+    return this.service.ingest(body, project.projectId);
   }
 
   /**

@@ -1,29 +1,33 @@
 import type { Request } from 'express';
 
 /**
- * 从上报请求里取出公钥。
+ * 从上报请求里取出公钥。**只认请求头 `X-Argus-Key`。**
  *
- * ── 为什么两处都要看，且 header 优先 ────────────────────────────────────
- *   常规通道：SDK 用 fetch，可以自由设请求头 → X-Argus-Key
- *   退场通道：pagehide 时只能用 navigator.sendBeacon，**它无法设置请求头**，
- *            也来不及等 fetch(keepalive) 的响应，只能把 key 拼在 URL 上
+ * ── 为什么砍掉了 `?key=` ────────────────────────────────────────────────
+ * SRS 原本为 `navigator.sendBeacon` 留了这条退场通道（那个 API 设不了请求头），
+ * 但本项目**从未实现 sendBeacon 降级**，SDK 只用 `fetch` 发请求。
+ * 于是"服务端收 query"变成了一条只有收端、没有发端的死代码 ——
+ * 它不会带来功能，只会让读代码的人以为"这条通道在用"，还会让多一条
+ * 凭据进入访问日志 / Referer / 浏览器历史的路径。
  *
- * 两者同时出现时以 header 为准：URL 会被写进访问日志、Referer、浏览器历史，
- * 是"更容易被抄走"的那条路，既然请求已经带了更安全的那个，就用它。
+ * 真要做退场通道时再把它加回来（届时 SRS 的 FR-2.2 也一并更新）。
  *
- * 注意这里**只取不验**：格式合法性、是否吊销、属于哪个项目，全部交给 KeysService。
+ * ── 关于 trim ───────────────────────────────────────────────────────────
+ * 从终端复制密钥常带尾随空格或换行。不 trim 的话 `"argus_pub_xxx\n"`
+ * 去查库查不到，报"密钥无效"，而用户看着自己的 key 明明是对的。
+ *
+ * ── 只取不验 ────────────────────────────────────────────────────────────
+ * 格式、是否吊销、属于哪个项目，全部交给 KeysService。
  * 认证逻辑散落在控制器里是 TC-05 最容易被破坏的地方。
  */
 export function extractIngestKey(req: Request): string | undefined {
   const header = req.headers['x-argus-key'];
-  // Node 里同名请求头可以出现多次，此时 header 会是数组
-  const fromHeader = Array.isArray(header) ? header[0] : header;
-  if (fromHeader !== undefined && fromHeader.trim() !== '') return fromHeader.trim();
+  // @types/node 把请求头声明成 string | string[] | undefined（set-cookie 那种会重复
+  // 的头是数组），所以这里必须处理数组分支才能过类型检查。实际运行时
+  // 同名普通头会被 Node 拼成 "a, b" 一个字符串，这个分支几乎不会命中。
+  const raw = Array.isArray(header) ? header[0] : header;
+  if (raw === undefined) return undefined;
 
-  const { key } = req.query as { key?: unknown };
-  // ?key=a&key=b 时 express 给的是数组，取第一个
-  const raw = Array.isArray(key) ? key[0] : key;
-  if (typeof raw === 'string' && raw.trim() !== '') return raw.trim();
-
-  return undefined;
+  const trimmed = raw.trim();
+  return trimmed === '' ? undefined : trimmed;
 }

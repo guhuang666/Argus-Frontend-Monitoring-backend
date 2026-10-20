@@ -1,10 +1,10 @@
-import { Body, Controller, Get, Post, Query, Req, UseGuards } from '@nestjs/common';
-import type { Request } from 'express';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ProjectScopeGuard } from '../auth/project-scope.guard';
-import { extractIngestKey } from '../common/ingest-key';
 import { TenantPageQueryDto } from '../common/dto/tenant-query.dto';
-import { KeysService } from '../keys/keys.service';
+import { IngestProject } from '../ratelimit/ingest-context';
+import type { IngestContext } from '../ratelimit/ingest-context';
+import { IngestRateLimitGuard } from '../ratelimit/ingest-rate-limit.guard';
 import { IngestPerfDto } from './dto/ingest-perf.dto';
 import { PerformanceService } from './performance.service';
 // interface 只用于类型，在装饰器签名里必须用 import type，
@@ -15,7 +15,7 @@ import type { IngestPerfResult } from './performance.service';
  * 性能指标：上报 + 查询。
  *
  * 同一资源同一路径，靠 HTTP 方法区分动作：
- *   POST /api/v1/performance   上报一条（公钥鉴权：X-Argus-Key 或 ?key=）
+ *   POST /api/v1/performance   上报一条（公钥鉴权 + 限流）
  *   GET  /api/v1/performance?projectId=...  分页查询（管理侧，S4 起改挂 JWT）
  *
  * 单独一组路由而不是塞进 error 那边：两套数据形状不同，共用入口时
@@ -24,19 +24,24 @@ import type { IngestPerfResult } from './performance.service';
  */
 @Controller('api/v1')
 export class PerformanceController {
-  constructor(
-    private readonly service: PerformanceService,
-    private readonly keys: KeysService,
-  ) {}
+  constructor(private readonly service: PerformanceService) {}
 
   /**
    * POST /api/v1/performance
    * 一次页面加载发一条（LCP / CLS / INP 三项 + 归因）。
+   *
+   * 与 POST /error 共用同一个 `IngestRateLimitGuard`：
+   * 两个入口如果只限一个，攻击者换个路径就绕过去了。
+   * 它们共享同一本账（key 里带 projectId，不带路由名），
+   * 所以「错误 + 性能」加起来算一个项目的总额度。
    */
   @Post('performance')
-  async store(@Body() body: IngestPerfDto, @Req() req: Request): Promise<IngestPerfResult> {
-    const projectId = await this.keys.resolveProjectByPublicKey(extractIngestKey(req));
-    return this.service.ingest(body, projectId);
+  @UseGuards(IngestRateLimitGuard)
+  async store(
+    @Body() body: IngestPerfDto,
+    @IngestProject() project: IngestContext,
+  ): Promise<IngestPerfResult> {
+    return this.service.ingest(body, project.projectId);
   }
 
   /**

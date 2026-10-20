@@ -23,26 +23,44 @@ const CACHE_TTL_MS = 30_000;
 export class KeysService {
   private readonly logger = new Logger(KeysService.name);
 
-  /** publicKey → projectId。吊销后靠 30 秒 TTL 自动失效 */
-  private readonly publicKeyCache = new Map<string, { projectId: string; expiresAt: number }>();
+  /**
+   * publicKey → 项目信息。吊销后靠 30 秒 TTL 自动失效。
+   * 缓存里同时存限流配置，避免上报热路径上多查一次 projects 表。
+   */
+  private readonly publicKeyCache = new Map<
+    string,
+    { projectId: string; rateLimitPerSec: number; expiresAt: number }
+  >();
 
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * 上报鉴权：公钥 → 项目 id。
+   * 上报鉴权：公钥 → 项目信息（id + 限流配置）。
    *
    * 查不到、已吊销、或压根没带 → 401（FR-5.7：不确定的情况一律拒绝）。
+   *
+   * ── 为什么把 rateLimitPerSec 也带出来 ──────────────────────────────────
+   * S6 的限流必须知道"这个项目的上限是多少"，而这个值就存在 projects 表上。
+   * 既然为了鉴权本来就要查一次 project_keys，顺手 join 出项目的限流值，
+   * 就不要让限流守卫再查一次库 —— 上报热路径上每一次多余的往返都是成本。
+   *
+   * 缓存里也一起存：`projects.rate_limit_per_sec` 被改之后最多 30 秒生效，
+   * 与公钥吊销的延迟一致，可以接受（改配置不是紧急操作，吊销才会急）。
    */
-  async resolveProjectByPublicKey(publicKey: string | undefined): Promise<string> {
+  async resolveProjectByPublicKey(
+    publicKey: string | undefined,
+  ): Promise<{ projectId: string; rateLimitPerSec: number }> {
     const key = publicKey?.trim();
     if (key === undefined || key === '') {
-      throw new UnauthorizedException(
-        '缺少上报密钥：请求头 X-Argus-Key 或查询参数 ?key=（退场通道只能用 query）',
-      );
+      // 只提请求头：URL 上的 ?key= 已经移除（见 common/ingest-key.ts 的说明），
+      // 报错里再写"或查询参数"会把人引到一条不存在的路上
+      throw new UnauthorizedException('缺少上报密钥：请在请求头里带 X-Argus-Key: argus_pub_...');
     }
 
     const hit = this.publicKeyCache.get(key);
-    if (hit !== undefined && hit.expiresAt > Date.now()) return hit.projectId;
+    if (hit !== undefined && hit.expiresAt > Date.now()) {
+      return { projectId: hit.projectId, rateLimitPerSec: hit.rateLimitPerSec };
+    }
 
     const row = await this.prisma.projectKey.findFirst({
       where: {
@@ -50,7 +68,10 @@ export class KeysService {
         // 未吊销，或还在宽限期内
         OR: [{ revokedAt: null }, { revokedAt: { gt: new Date() } }],
       },
-      select: { projectId: true },
+      select: {
+        projectId: true,
+        project: { select: { rateLimitPerSec: true } },
+      },
     });
 
     if (row === null) {
@@ -58,11 +79,16 @@ export class KeysService {
       throw new UnauthorizedException('上报密钥无效或已吊销');
     }
 
-    this.publicKeyCache.set(key, {
+    const resolved = {
       projectId: row.projectId,
+      rateLimitPerSec: row.project.rateLimitPerSec,
+    };
+
+    this.publicKeyCache.set(key, {
+      ...resolved,
       expiresAt: Date.now() + CACHE_TTL_MS,
     });
-    return row.projectId;
+    return resolved;
   }
 
   /**

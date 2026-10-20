@@ -9,6 +9,7 @@ import { KeysModule } from './keys/keys.module';
 import { PerformanceModule } from './performance/performance.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProjectsModule } from './projects/projects.module';
+import { RateLimitModule } from './ratelimit/ratelimit.module';
 import { SourcemapsModule } from './sourcemaps/sourcemaps.module';
 
 @Module({
@@ -20,6 +21,9 @@ import { SourcemapsModule } from './sourcemaps/sourcemaps.module';
     PrismaModule,
     // 密钥解析（M4-S2）。@Global：上报/性能/上传/项目四处都要用。
     KeysModule,
+    // 限流（M4-S6）。@Global：上报与性能两个入口的守卫都靠它实例化。
+    // 依赖 KeysModule 里的 KeysService（它已是 @Global）。
+    RateLimitModule,
     // 人身份（M4-S4）。@Global：四个读接口模块的守卫都靠它实例化。
     // 它只放 API 进程 —— worker 不鉴权，也不该有登录能力。
     AuthModule,

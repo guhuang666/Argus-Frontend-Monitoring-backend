@@ -69,7 +69,9 @@ export class JwtAuthGuard implements CanActivate {
  * 只认 `Bearer <token>` 这一种写法（大小写不敏感）。
  * 不额外支持 `?token=`：JWT 出现在 URL 里会进访问日志、Referer、浏览器历史 ——
  * 而 JWT 就是登录凭据本身，泄露它等于泄露账号。
- * （上报公钥允许走 ?key=，是因为那不是账号凭据，且 sendBeacon 设不了请求头。）
+ *
+ * 同理，上报公钥也**只走请求头**（`?key=` 已移除）。判断标准是"泄露后果"：
+ * 能"以你的名义做事"的凭据，永远别放进 URL。
  */
 function extractBearer(header: string | string[] | undefined): string | undefined {
   const raw = Array.isArray(header) ? header[0] : header;
