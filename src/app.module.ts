@@ -9,7 +9,6 @@ import { KeysModule } from './keys/keys.module';
 import { PerformanceModule } from './performance/performance.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProjectsModule } from './projects/projects.module';
-import { QueryModule } from './query/query.module';
 import { SourcemapsModule } from './sourcemaps/sourcemaps.module';
 
 @Module({
@@ -35,7 +34,6 @@ import { SourcemapsModule } from './sourcemaps/sourcemaps.module';
     // Sourcemap 上传（M3）。同样只在 API 进程 —— 落盘/入库发生在 HTTP 请求里，
     // worker 只需要"读"已存好的 map，那是另一个模块的事。
     SourcemapsModule,
-    QueryModule,
   ],
   controllers: [AppController],
   providers: [AppService],

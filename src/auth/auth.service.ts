@@ -8,14 +8,10 @@ import {
 import { randomBytes } from 'node:crypto';
 import { Prisma } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { generatePublicKey, generateSecretKey, hashSecret } from '../common/keys';
 import { DUMMY_PASSWORD_HASH, hashPassword, verifyPassword } from './password';
 import { JwtService } from './jwt.service';
 import type { LoginDto } from './dto/login.dto';
 import type { RegisterDto } from './dto/register.dto';
-
-/** 注册时自动建的项目名。和 seed.cjs 保持一致，看板上不会出现两套叫法 */
-const DEFAULT_PROJECT_NAME = '默认项目';
 
 @Injectable()
 export class AuthService {
@@ -27,27 +23,32 @@ export class AuthService {
   ) {}
 
   /**
-   * 注册：一个人 + 一个组织 + 一个默认项目 + 一对密钥，一次事务里全建好。
+   * 注册：一个人 + 一个组织。**不建项目、不发密钥**。
    *
-   * ── 为什么必须在一个事务里 ──────────────────────────────────────────────
-   * 这几步少任何一步，账号都会处于"能登录但完全没法用"的状态：
-   *   · 没组织  → 登录后项目列表是空的，用户以为自己没注册成功
-   *   · 没项目  → 没有地方放数据
-   *   · 没密钥  → 有项目但上报全 401，而且他不会知道原因
-   * 半成品比彻底失败难查得多，所以要么全成、要么全不成。
+   * ── 为什么注册不再顺手建一个"默认项目" ──────────────────────────────────
+   * 那会让两件事绑死：用户还没想好要监控什么，系统就先替他建了一个叫
+   * 「默认项目」的东西，还发了一对被他自己都记不住的密钥。结果是：
+   *   · 第一个项目永远是名字没意义的"默认项目"
+   *   · 密钥在注册那一屏一闪而过，很多人根本没抄下来
+   *   · 想改项目名？没这个功能。只能删了重来（也没这个功能）
+   * 拆开之后路径很清楚：注册 → 看板提示"还没有项目" → 点「新建项目」→
+   * 在弹窗里填自己的名字 → 拿到一对属于它的密钥。私钥仍然只显示一次，
+   * 但那一次是用户主动触发的，他知道自己在看什么。
    *
-   * ── 为什么还要把私钥明文返回一次 ────────────────────────────────────────
-   * 库里只存 sha256，这是**唯一一次**能拿到明文的机会。前端必须在那一次
-   * 让用户复制走（我们的看板会在注册成功页显示它）。
+   * ── 为什么组织仍然在注册时建 ────────────────────────────────────────────
+   * `users.org_id` 是 NOT NULL：没有组织，这个账号就无家可归，也什么都管不了。
+   * 所以"注册即建组织"是数据模型的约束，不是偷懒。
+   * （真要拆，得先做一个"创建/加入工作区"的引导页，那是另一件事。）
+   *
+   * ── 为什么还要事务 ──────────────────────────────────────────────────────
+   * 只剩两步，但顺序有意义：组织先建（拿到 id），用户才能带上 org_id。
+   * 中间失败留下一个没人属于的空组织，会占着 slug 再也删不掉。
    */
   async register(dto: RegisterDto) {
     const email = dto.email.trim().toLowerCase();
     const passwordHash = await hashPassword(dto.password);
     // 空串一律当"没填"：留一个空白的 displayName 会让界面上出现一行空白的欢迎语
     const displayName = dto.display_name?.trim() || null;
-
-    const publicKey = generatePublicKey();
-    const secretKey = generateSecretKey();
     const orgName = dto.organization_name?.trim() || `${email.split('@')[0]} 的工作区`;
 
     let created;
@@ -60,27 +61,13 @@ export class AuthService {
         });
 
         const user = await tx.user.create({
-          // MVP-B：组织先建，用户直接带上 org_id。
+          // 组织先建，用户直接带上 org_id。
           // 顺序不能反 —— org_id 是 NOT NULL 外键，没有组织就没法插用户
           data: { email, passwordHash, displayName, orgId: org.id, role: 'owner' },
           select: { id: true, email: true, displayName: true, createdAt: true },
         });
 
-        const project = await tx.project.create({
-          data: { orgId: org.id, name: DEFAULT_PROJECT_NAME },
-          select: { id: true, name: true },
-        });
-
-        await tx.projectKey.create({
-          data: {
-            projectId: project.id,
-            publicKey,
-            secretKeyHash: hashSecret(secretKey),
-            label: 'initial',
-          },
-        });
-
-        return { user, org, project };
+        return { user, org };
       });
     } catch (err) {
       // 邮箱唯一索引。不能在事务外"先查再插"：两个并发注册会同时通过检查，
@@ -92,7 +79,7 @@ export class AuthService {
     }
 
     const { token, expiresIn } = this.jwt.sign(created.user.id);
-    this.logger.log(`新用户注册: ${email} → 组织 ${created.org.slug} / 项目 ${created.project.id}`);
+    this.logger.log(`新用户注册: ${email} → 组织 ${created.org.slug}（尚无项目）`);
 
     return {
       access_token: token,
@@ -111,10 +98,8 @@ export class AuthService {
       },
       // MVP-B：角色挂在用户上，不再挂在"成员关系"里
       role: 'owner',
-      project: { id: created.project.id, name: created.project.name, public_key: publicKey },
-      // 明文私钥只在这里出现一次。字段名带 `once` 是为了让前端和后端的人
-      // 一眼看出"这不是一个可以再查一次的东西"
-      secret_key_once: secretKey,
+      // 项目与密钥不在这里 —— 走 POST /api/v1/projects。
+      // 前端拿不到 project 字段时不该当成"出错了"，那正是下一步要做的事
     };
   }
 

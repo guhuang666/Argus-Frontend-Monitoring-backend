@@ -129,7 +129,12 @@ model ProjectKey {
   publicKey String @unique @map("public_key") @db.VarChar(64)
 
   /// 私钥的 sha256（hex）。原文只在创建时打印一次，库里永不明文
-  secretKeyHash String @map("secret_key_hash") @db.VarChar(64)
+  ///
+  /// **唯一索引**：上传 Sourcemap 时不再在 URL 里带 projectId，服务端靠
+  /// `sha256(secret)` 直接反查是哪个项目。没有这条索引，每次上传都是全表扫描。
+  /// 唯一性同时把"一把私钥只属于一个项目"变成数据库级约束 ——
+  /// 而不是靠调用方记得"私钥要与项目配对"。
+  secretKeyHash String @unique @map("secret_key_hash") @db.VarChar(64)
 
   /// 用途标签，如 production / staging / ci。给人看的，不参与鉴权
   label String? @db.VarChar(100)
