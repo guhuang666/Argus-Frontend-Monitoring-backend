@@ -1,0 +1,73 @@
+9fcb0b5738e72da75d34e87a59d7ef98
+"use strict";
+var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+var __param = (this && this.__param) || function (paramIndex, decorator) {
+    return function (target, key) { decorator(target, key, paramIndex); }
+};
+var ProjectQueueService_1;
+var _a;
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ProjectQueueService = void 0;
+const bullmq_1 = require("@nestjs/bullmq");
+const common_1 = require("@nestjs/common");
+const bullmq_2 = require("bullmq");
+const redis_connection_1 = require("./redis-connection");
+const queue_constants_1 = require("./queue.constants");
+/**
+ * 按项目取队列（M4-S7）。
+ *
+ * ── 懒创建 + 缓存 ────────────────────────────────────────────────────────
+ * 上报热路径上不能每次都 `new Queue(...)` —— 那会为每个请求建一条 ioredis 连接。
+ * 所以按队列名缓存，同一个项目的后续上报复用同一个 Queue 实例。
+ *
+ * ── 为什么从 base 队列上拷连接配置 ──────────────────────────────────────
+ * `queue.opts.connection` 就是 `BullModule.forRootAsync` 里那份配置。拷它而不是
+ * 重新读 env，是为了让"生产者写的队列"和"消费者读的队列"必然连同一个 Redis。
+ *
+ * ── 为什么只做生产者 ────────────────────────────────────────────────────
+ * 消费侧需要每个项目一个 Worker（阻塞连接 + 独立并发），那是
+ * `grouping/project-worker.manager.ts` 的事，而且只在 worker 进程里跑。
+ */
+let ProjectQueueService = ProjectQueueService_1 = class ProjectQueueService {
+    logger = new common_1.Logger(ProjectQueueService_1.name);
+    queues = new Map();
+    constructor(base) {
+        // base 队列本身的连接配置就是全局配置；拿不到时退回读 env（正常走不到）
+        this.connection = base.opts.connection ?? (0, redis_connection_1.buildRedisConnection)();
+    }
+    connection;
+    /** 取（必要时创建）某个项目的队列 */
+    queueFor(projectId) {
+        const name = (0, queue_constants_1.projectQueueName)(projectId);
+        let queue = this.queues.get(name);
+        if (queue === undefined) {
+            queue = new bullmq_2.Queue(name, { connection: this.connection });
+            queue.on('error', (err) => {
+                this.logger.warn(`队列「${name}」连接异常: ${err.message}`);
+            });
+            this.queues.set(name, queue);
+        }
+        return queue;
+    }
+    async onModuleDestroy() {
+        await Promise.all([...this.queues.values()].map((queue) => queue.close().catch((err) => {
+            this.logger.warn(`关闭队列失败: ${String(err)}`);
+        })));
+        this.queues.clear();
+    }
+};
+exports.ProjectQueueService = ProjectQueueService;
+exports.ProjectQueueService = ProjectQueueService = ProjectQueueService_1 = __decorate([
+    (0, common_1.Injectable)(),
+    __param(0, (0, bullmq_1.InjectQueue)(queue_constants_1.ERROR_EVENT_QUEUE)),
+    __metadata("design:paramtypes", [typeof (_a = typeof bullmq_2.Queue !== "undefined" && bullmq_2.Queue) === "function" ? _a : Object])
+], ProjectQueueService);
+//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJmaWxlIjoiRTpcXEFyZ3VzXFxiYWNrZW5kXFxzcmNcXHF1ZXVlXFxwcm9qZWN0LXF1ZXVlLnNlcnZpY2UudHMiLCJtYXBwaW5ncyI6Ijs7Ozs7Ozs7Ozs7Ozs7Ozs7QUFBQSwyQ0FBNkM7QUFDN0MsMkNBQXFFO0FBQ3JFLG1DQUErQjtBQUMvQix5REFBMEQ7QUFDMUQsdURBQWdHO0FBRWhHOzs7Ozs7Ozs7Ozs7OztHQWNHO0FBRUksSUFBTSxtQkFBbUIsMkJBQXpCLE1BQU0sbUJBQW1CO0lBQ2IsTUFBTSxHQUFHLElBQUksZUFBTSxDQUFDLHFCQUFtQixDQUFDLElBQUksQ0FBQyxDQUFDO0lBQzlDLE1BQU0sR0FBRyxJQUFJLEdBQUcsRUFBb0MsQ0FBQztJQUV0RSxZQUE0QyxJQUFXO1FBQ3JELDBDQUEwQztRQUMxQyxJQUFJLENBQUMsVUFBVSxHQUFHLElBQUksQ0FBQyxJQUFJLENBQUMsVUFBVSxJQUFJLElBQUEsdUNBQW9CLEdBQUUsQ0FBQztJQUNuRSxDQUFDO0lBRWdCLFVBQVUsQ0FBMkM7SUFFdEUsc0JBQXNCO0lBQ3RCLFFBQVEsQ0FBQyxTQUFpQjtRQUN4QixNQUFNLElBQUksR0FBRyxJQUFBLGtDQUFnQixFQUFDLFNBQVMsQ0FBQyxDQUFDO1FBQ3pDLElBQUksS0FBSyxHQUFHLElBQUksQ0FBQyxNQUFNLENBQUMsR0FBRyxDQUFDLElBQUksQ0FBQyxDQUFDO1FBQ2xDLElBQUksS0FBSyxLQUFLLFNBQVMsRUFBRSxDQUFDO1lBQ3hCLEtBQUssR0FBRyxJQUFJLGNBQUssQ0FBb0IsSUFBSSxFQUFFLEVBQUUsVUFBVSxFQUFFLElBQUksQ0FBQyxVQUFVLEVBQUUsQ0FBQyxDQUFDO1lBQzVFLEtBQUssQ0FBQyxFQUFFLENBQUMsT0FBTyxFQUFFLENBQUMsR0FBVSxFQUFFLEVBQUU7Z0JBQy9CLElBQUksQ0FBQyxNQUFNLENBQUMsSUFBSSxDQUFDLE1BQU0sSUFBSSxVQUFVLEdBQUcsQ0FBQyxPQUFPLEVBQUUsQ0FBQyxDQUFDO1lBQ3RELENBQUMsQ0FBQyxDQUFDO1lBQ0gsSUFBSSxDQUFDLE1BQU0sQ0FBQyxHQUFHLENBQUMsSUFBSSxFQUFFLEtBQUssQ0FBQyxDQUFDO1FBQy9CLENBQUM7UUFDRCxPQUFPLEtBQUssQ0FBQztJQUNmLENBQUM7SUFFRCxLQUFLLENBQUMsZUFBZTtRQUNuQixNQUFNLE9BQU8sQ0FBQyxHQUFHLENBQ2YsQ0FBQyxHQUFHLElBQUksQ0FBQyxNQUFNLENBQUMsTUFBTSxFQUFFLENBQUMsQ0FBQyxHQUFHLENBQUMsQ0FBQyxLQUFLLEVBQUUsRUFBRSxDQUN0QyxLQUFLLENBQUMsS0FBSyxFQUFFLENBQUMsS0FBSyxDQUFDLENBQUMsR0FBWSxFQUFFLEVBQUU7WUFDbkMsSUFBSSxDQUFDLE1BQU0sQ0FBQyxJQUFJLENBQUMsV0FBVyxNQUFNLENBQUMsR0FBRyxDQUFDLEVBQUUsQ0FBQyxDQUFDO1FBQzdDLENBQUMsQ0FBQyxDQUNILENBQ0YsQ0FBQztRQUNGLElBQUksQ0FBQyxNQUFNLENBQUMsS0FBSyxFQUFFLENBQUM7SUFDdEIsQ0FBQztDQUNGLENBQUE7QUFuQ1ksa0RBQW1COzhCQUFuQixtQkFBbUI7SUFEL0IsSUFBQSxtQkFBVSxHQUFFO0lBS0UsV0FBQSxJQUFBLG9CQUFXLEVBQUMsbUNBQWlCLENBQUMsQ0FBQTt5REFBTyxjQUFLLG9CQUFMLGNBQUs7R0FKNUMsbUJBQW1CLENBbUMvQiIsIm5hbWVzIjpbXSwic291cmNlcyI6WyJFOlxcQXJndXNcXGJhY2tlbmRcXHNyY1xccXVldWVcXHByb2plY3QtcXVldWUuc2VydmljZS50cyJdLCJzb3VyY2VzQ29udGVudCI6WyJpbXBvcnQgeyBJbmplY3RRdWV1ZSB9IGZyb20gJ0BuZXN0anMvYnVsbG1xJztcbmltcG9ydCB7IEluamVjdGFibGUsIExvZ2dlciwgT25Nb2R1bGVEZXN0cm95IH0gZnJvbSAnQG5lc3Rqcy9jb21tb24nO1xuaW1wb3J0IHsgUXVldWUgfSBmcm9tICdidWxsbXEnO1xuaW1wb3J0IHsgYnVpbGRSZWRpc0Nvbm5lY3Rpb24gfSBmcm9tICcuL3JlZGlzLWNvbm5lY3Rpb24nO1xuaW1wb3J0IHsgRVJST1JfRVZFTlRfUVVFVUUsIHByb2plY3RRdWV1ZU5hbWUsIHR5cGUgRXJyb3JFdmVudEpvYkRhdGEgfSBmcm9tICcuL3F1ZXVlLmNvbnN0YW50cyc7XG5cbi8qKlxuICog5oyJ6aG555uu5Y+W6Zif5YiX77yITTQtUzfvvInjgIJcbiAqXG4gKiDilIDilIAg5oeS5Yib5bu6ICsg57yT5a2YIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgFxuICog5LiK5oql54Ot6Lev5b6E5LiK5LiN6IO95q+P5qyh6YO9IGBuZXcgUXVldWUoLi4uKWAg4oCU4oCUIOmCo+S8muS4uuavj+S4quivt+axguW7uuS4gOadoSBpb3JlZGlzIOi/nuaOpeOAglxuICog5omA5Lul5oyJ6Zif5YiX5ZCN57yT5a2Y77yM5ZCM5LiA5Liq6aG555uu55qE5ZCO57ut5LiK5oql5aSN55So5ZCM5LiA5LiqIFF1ZXVlIOWunuS+i+OAglxuICpcbiAqIOKUgOKUgCDkuLrku4DkuYjku44gYmFzZSDpmJ/liJfkuIrmi7fov57mjqXphY3nva4g4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4gKiBgcXVldWUub3B0cy5jb25uZWN0aW9uYCDlsLHmmK8gYEJ1bGxNb2R1bGUuZm9yUm9vdEFzeW5jYCDph4zpgqPku73phY3nva7jgILmi7flroPogIzkuI3mmK9cbiAqIOmHjeaWsOivuyBlbnbvvIzmmK/kuLrkuoborqlcIueUn+S6p+iAheWGmeeahOmYn+WIl1wi5ZKMXCLmtojotLnogIXor7vnmoTpmJ/liJdcIuW/heeEtui/nuWQjOS4gOS4qiBSZWRpc+OAglxuICpcbiAqIOKUgOKUgCDkuLrku4DkuYjlj6rlgZrnlJ/kuqfogIUg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4gKiDmtojotLnkvqfpnIDopoHmr4/kuKrpobnnm67kuIDkuKogV29ya2Vy77yI6Zi75aGe6L+e5o6lICsg54us56uL5bm25Y+R77yJ77yM6YKj5pivXG4gKiBgZ3JvdXBpbmcvcHJvamVjdC13b3JrZXIubWFuYWdlci50c2Ag55qE5LqL77yM6ICM5LiU5Y+q5ZyoIHdvcmtlciDov5vnqIvph4zot5HjgIJcbiAqL1xuQEluamVjdGFibGUoKVxuZXhwb3J0IGNsYXNzIFByb2plY3RRdWV1ZVNlcnZpY2UgaW1wbGVtZW50cyBPbk1vZHVsZURlc3Ryb3kge1xuICBwcml2YXRlIHJlYWRvbmx5IGxvZ2dlciA9IG5ldyBMb2dnZXIoUHJvamVjdFF1ZXVlU2VydmljZS5uYW1lKTtcbiAgcHJpdmF0ZSByZWFkb25seSBxdWV1ZXMgPSBuZXcgTWFwPHN0cmluZywgUXVldWU8RXJyb3JFdmVudEpvYkRhdGE+PigpO1xuXG4gIGNvbnN0cnVjdG9yKEBJbmplY3RRdWV1ZShFUlJPUl9FVkVOVF9RVUVVRSkgYmFzZTogUXVldWUpIHtcbiAgICAvLyBiYXNlIOmYn+WIl+acrOi6q+eahOi/nuaOpemFjee9ruWwseaYr+WFqOWxgOmFjee9ru+8m+aLv+S4jeWIsOaXtumAgOWbnuivuyBlbnbvvIjmraPluLjotbDkuI3liLDvvIlcbiAgICB0aGlzLmNvbm5lY3Rpb24gPSBiYXNlLm9wdHMuY29ubmVjdGlvbiA/PyBidWlsZFJlZGlzQ29ubmVjdGlvbigpO1xuICB9XG5cbiAgcHJpdmF0ZSByZWFkb25seSBjb25uZWN0aW9uOiBOb25OdWxsYWJsZTxRdWV1ZVsnb3B0cyddWydjb25uZWN0aW9uJ10+O1xuXG4gIC8qKiDlj5bvvIjlv4XopoHml7bliJvlu7rvvInmn5DkuKrpobnnm67nmoTpmJ/liJcgKi9cbiAgcXVldWVGb3IocHJvamVjdElkOiBzdHJpbmcpOiBRdWV1ZTxFcnJvckV2ZW50Sm9iRGF0YT4ge1xuICAgIGNvbnN0IG5hbWUgPSBwcm9qZWN0UXVldWVOYW1lKHByb2plY3RJZCk7XG4gICAgbGV0IHF1ZXVlID0gdGhpcy5xdWV1ZXMuZ2V0KG5hbWUpO1xuICAgIGlmIChxdWV1ZSA9PT0gdW5kZWZpbmVkKSB7XG4gICAgICBxdWV1ZSA9IG5ldyBRdWV1ZTxFcnJvckV2ZW50Sm9iRGF0YT4obmFtZSwgeyBjb25uZWN0aW9uOiB0aGlzLmNvbm5lY3Rpb24gfSk7XG4gICAgICBxdWV1ZS5vbignZXJyb3InLCAoZXJyOiBFcnJvcikgPT4ge1xuICAgICAgICB0aGlzLmxvZ2dlci53YXJuKGDpmJ/liJfjgIwke25hbWV944CN6L+e5o6l5byC5bi4OiAke2Vyci5tZXNzYWdlfWApO1xuICAgICAgfSk7XG4gICAgICB0aGlzLnF1ZXVlcy5zZXQobmFtZSwgcXVldWUpO1xuICAgIH1cbiAgICByZXR1cm4gcXVldWU7XG4gIH1cblxuICBhc3luYyBvbk1vZHVsZURlc3Ryb3koKTogUHJvbWlzZTx2b2lkPiB7XG4gICAgYXdhaXQgUHJvbWlzZS5hbGwoXG4gICAgICBbLi4udGhpcy5xdWV1ZXMudmFsdWVzKCldLm1hcCgocXVldWUpID0+XG4gICAgICAgIHF1ZXVlLmNsb3NlKCkuY2F0Y2goKGVycjogdW5rbm93bikgPT4ge1xuICAgICAgICAgIHRoaXMubG9nZ2VyLndhcm4oYOWFs+mXremYn+WIl+Wksei0pTogJHtTdHJpbmcoZXJyKX1gKTtcbiAgICAgICAgfSksXG4gICAgICApLFxuICAgICk7XG4gICAgdGhpcy5xdWV1ZXMuY2xlYXIoKTtcbiAgfVxufVxuIl0sInZlcnNpb24iOjN9

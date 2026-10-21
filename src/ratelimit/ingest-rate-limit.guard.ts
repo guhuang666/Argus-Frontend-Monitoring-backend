@@ -70,6 +70,10 @@ export class IngestRateLimitGuard implements CanActivate {
       const retryAfterSec = Math.max(1, Math.ceil(verdict.retryAfterMs / 1000));
       response.setHeader('Retry-After', String(retryAfterSec));
 
+      // FR-6.4：这一条是被丢掉的，记一笔 —— 否则客户只能从"事件变少了"猜到
+      // 自己被限流，而那种怀疑很容易被误判成"SDK 坏了"
+      await this.limiter.recordDropped(project.projectId);
+
       // 只记日志，不把 projectId 拼进响应体 —— 响应可能被浏览器控制台截图外传
       this.logger.warn(
         `限流拒绝: project=${project.projectId} limit=${project.rateLimitPerSec}/s retryAfter=${retryAfterSec}s`,

@@ -255,7 +255,7 @@ describe('ErrorEventProcessor', () => {
       const prisma = fakePrisma({ claimed: CLAIMED });
       const dlq = fakeDlq();
 
-      await build(prisma, dlq).process(jobLike({}));
+      await build(prisma, dlq).handle(jobLike({}));
 
       expect(prisma.calls).toContain('tx:claim');
       expect(
@@ -269,7 +269,7 @@ describe('ErrorEventProcessor', () => {
       const prisma = fakePrisma({ claimed: CLAIMED });
       const dlq = fakeDlq();
 
-      await build(prisma, dlq).process(jobLike({}));
+      await build(prisma, dlq).handle(jobLike({}));
 
       // 顺序即证明：归并两步都发生在 tx:begin 之后，没有被挪到事务外
       expect(prisma.calls).toEqual([
@@ -311,7 +311,7 @@ describe('ErrorEventProcessor', () => {
       const claimed: ClaimedEvent = { ...CLAIMED, release: 'web@1.0.0' };
       const prisma = fakePrisma({ claimed });
 
-      await build(prisma, fakeDlq(), fullyResolvedLookup()).process(
+      await build(prisma, fakeDlq(), fullyResolvedLookup()).handle(
         jobLike({}),
       );
 
@@ -348,7 +348,7 @@ describe('ErrorEventProcessor', () => {
       // CLAIMED.release = null；即使 lookup 能还原，也不该被调用出 v2 结果
       const prisma = fakePrisma({ claimed: CLAIMED });
 
-      await build(prisma, fakeDlq(), fullyResolvedLookup()).process(
+      await build(prisma, fakeDlq(), fullyResolvedLookup()).handle(
         jobLike({}),
       );
 
@@ -362,7 +362,7 @@ describe('ErrorEventProcessor', () => {
     it('已解决的问题又收到事件 → 回归未处理（FR-4.8）', async () => {
       const prisma = fakePrisma({ claimed: CLAIMED, groupStatus: 'resolved' });
 
-      await build(prisma, fakeDlq()).process(jobLike({}));
+      await build(prisma, fakeDlq()).handle(jobLike({}));
 
       // 归并之后多一次 errorGroup.update：把 status 拉回 unresolved 并清空 resolved_at
       expect(prisma.calls).toEqual([
@@ -385,7 +385,7 @@ describe('ErrorEventProcessor', () => {
         groupStatus: 'unresolved',
       });
 
-      await build(prisma, fakeDlq()).process(jobLike({}));
+      await build(prisma, fakeDlq()).handle(jobLike({}));
 
       expect(prisma.calls).not.toContain('tx:regressGroup');
       expect(prisma.groupUpdateArgs).toBeNull();
@@ -397,7 +397,7 @@ describe('ErrorEventProcessor', () => {
         existing: { processedAt: new Date() },
       });
 
-      await build(prisma, fakeDlq()).process(jobLike({}));
+      await build(prisma, fakeDlq()).handle(jobLike({}));
 
       expect(prisma.calls).not.toContain('tx:upsertGroup');
       expect(prisma.calls).not.toContain('tx:updateEvent');
@@ -412,7 +412,7 @@ describe('ErrorEventProcessor', () => {
       const dlq = fakeDlq();
 
       await expect(
-        build(prisma, dlq).process(jobLike({})),
+        build(prisma, dlq).handle(jobLike({})),
       ).resolves.toBeUndefined();
 
       expect(prisma.calls).toContain('db:findUnique');
@@ -423,7 +423,7 @@ describe('ErrorEventProcessor', () => {
     it('没抢到是因为事件不存在 → 明确 warn（job 指向了不存在的行）', async () => {
       const prisma = fakePrisma({ claimed: null, existing: null });
 
-      await build(prisma, fakeDlq()).process(jobLike({}));
+      await build(prisma, fakeDlq()).handle(jobLike({}));
 
       expect(logged.some((l) => l.includes('事件不存在'))).toBe(true);
     });
@@ -431,7 +431,7 @@ describe('ErrorEventProcessor', () => {
     it('声明用的查询放在事务里（W4 要往里加归并，必须同事务）', async () => {
       const prisma = fakePrisma({ claimed: CLAIMED });
 
-      await build(prisma, fakeDlq()).process(jobLike({}));
+      await build(prisma, fakeDlq()).handle(jobLike({}));
 
       expect(prisma.calls[0]).toBe('tx:begin');
     });
@@ -534,15 +534,5 @@ describe('ErrorEventProcessor', () => {
     });
   });
 
-  it('Worker 自身错误走 warn，不吞不崩', () => {
-    const processor = build(fakePrisma({}), fakeDlq());
 
-    processor.onError(new Error('connect ECONNREFUSED 127.0.0.1:6379'));
-
-    expect(
-      logged.some(
-        (l) => l.includes('Worker 异常') && l.includes('ECONNREFUSED'),
-      ),
-    ).toBe(true);
-  });
 });

@@ -8,6 +8,7 @@ import {
 import { Prisma } from '../../generated/prisma/client';
 import { generatePublicKey, generateSecretKey, hashSecret } from '../common/keys';
 import { PrismaService } from '../prisma/prisma.service';
+import { RateLimitService } from '../ratelimit/rate-limit.service';
 import type { CreateProjectDto } from './dto/create-project.dto';
 
 /**
@@ -33,7 +34,12 @@ const CAN_CREATE_PROJECT_ROLES = new Set(['owner', 'admin']);
  */
 @Injectable()
 export class ProjectsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // 丢件计数存在 Redis（M4-S7 / FR-6.4），所以要借限流服务读一下。
+    // RateLimitModule 是 @Global，ProjectsModule 不必显式 imports
+    private readonly limiter: RateLimitService,
+  ) {}
 
   /**
    * 项目列表（这个组织下的全部项目）。
@@ -62,8 +68,14 @@ export class ProjectsService {
       },
     });
 
+    // 丢件数在 Redis 里，只能逐个查（项目上限 20，一次 20 条 HGET 可接受）。
+    // 并发查而不是 for 循环 await：每个都是毫秒级，但串行 20 次就是 20 倍 RTT
+    const dropped = await Promise.all(
+      rows.map((row) => this.limiter.droppedToday(row.id)),
+    );
+
     return {
-      items: rows.map((row) => ({
+      items: rows.map((row, index) => ({
         id: row.id,
         name: row.name,
         platform: row.platform,
@@ -76,6 +88,12 @@ export class ProjectsService {
         public_key: row.keys[0]?.publicKey ?? null,
         issue_count: row._count.errorGroups,
         event_count: row._count.errorEvents,
+        /**
+         * 今天因限流被丢掉的条数（FR-6.4）。
+         * `null` = 查不到（Redis 不可用）；`0` = 确实没丢。这两件事必须分开，
+         * 否则"Redis 挂了"会显示成"一切正常"。
+         */
+        dropped_today: dropped[index],
       })),
     };
   }

@@ -1,14 +1,11 @@
-import { InjectQueue } from '@nestjs/bullmq';
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
-import type { Queue } from 'bullmq';
 import { Prisma, type ErrorEvent } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ProjectQueueService } from '../queue/project-queue.service';
 import {
   ERROR_EVENT_JOB,
   ERROR_EVENT_JOB_OPTIONS,
-  ERROR_EVENT_QUEUE,
   toJobId,
-  type ErrorEventJobData,
 } from '../queue/queue.constants';
 import { IngestErrorDto } from './dto/ingest-error.dto';
 
@@ -24,7 +21,9 @@ export class ErrorEventsService {
 
   constructor(
     private readonly prisma: PrismaService,
-    @InjectQueue(ERROR_EVENT_QUEUE) private readonly queue: Queue<ErrorEventJobData>,
+    // 不再是固定的一条队列：S7 起按项目分流（每个项目一条 error-events-<id>），
+    // 这样某个项目的积压不会把别的项目堵在队尾
+    private readonly queues: ProjectQueueService,
   ) {}
 
   /**
@@ -91,7 +90,7 @@ export class ErrorEventsService {
       throw err;
     }
 
-    await this.enqueue(payload.event_id);
+    await this.enqueue(payload.event_id, projectId);
 
     return { event_id: payload.event_id, duplicate: false };
   }
@@ -114,16 +113,18 @@ export class ErrorEventsService {
    * duplicate 分支不入队：这条事件上一次已经入过队（jobId 相同，去重窗口内会被
    * 静默忽略），真要是上次入队失败，补扫会按 processed_at IS NULL 把它捞回来。
    */
-  private async enqueue(eventId: string): Promise<void> {
+  private async enqueue(eventId: string, projectId: string): Promise<void> {
     try {
-      await this.queue.add(
+      // S7：投到**这个项目的**队列，而不是全局那条
+      await this.queues.queueFor(projectId).add(
         ERROR_EVENT_JOB,
         { eventId },
         { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(eventId) },
       );
     } catch (err) {
       this.logger.error(
-        `入队失败，事件已入库但尚未归并（等补扫兜住）: event_id=${eventId} 原因=${String(err)}`,
+        `入队失败，事件已入库但尚未归并（等补扫兜住）: event_id=${eventId} ` +
+          `project=${projectId} 原因=${String(err)}`,
       );
     }
   }

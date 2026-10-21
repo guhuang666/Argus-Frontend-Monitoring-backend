@@ -1,7 +1,7 @@
-﻿import { Logger } from '@nestjs/common';
-import type { Queue } from 'bullmq';
+import { Logger } from '@nestjs/common';
 import { Prisma } from '../../generated/prisma/client';
 import type { PrismaService } from '../prisma/prisma.service';
+import type { ProjectQueueService } from '../queue/project-queue.service';
 
 /**
  * jest 加载不了 generated/prisma/client.ts —— 它是 prisma-client 生成器产的 TS 源码，
@@ -99,11 +99,29 @@ function fakeQueue(behavior: { add?: () => Promise<unknown> } = {}) {
   };
 }
 
+/**
+ * 假的 ProjectQueueService。
+ *
+ * S7 之后 service 不再持有"那一条队列"，而是按项目取：
+ * `queues.queueFor(projectId)`。所以这里要假装成"按项目分发"的样子，
+ * 并记下它被问的是哪个 projectId —— 这正好用来断言"投对了项目的队列"。
+ */
+function fakeQueues(queue: ReturnType<typeof fakeQueue>) {
+  const asked: string[] = [];
+  return {
+    asked,
+    queueFor: (projectId: string) => {
+      asked.push(projectId);
+      return queue;
+    },
+  };
+}
+
 function build(prisma: ReturnType<typeof fakePrisma>, queue: ReturnType<typeof fakeQueue>) {
   return new ErrorEventsService(
     prisma as unknown as PrismaService,
-    // 这里只需要 Queue 的 add / on 两个方法，其余强转掉
-    queue as unknown as Queue,
+    // 这里只需要 queueFor 一个方法，其余强转掉
+    fakeQueues(queue) as unknown as ProjectQueueService,
   );
 }
 

@@ -1,10 +1,5 @@
-import {
-  InjectQueue,
-  OnWorkerEvent,
-  Processor,
-  WorkerHost,
-} from '@nestjs/bullmq';
-import { Logger } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Injectable, Logger } from '@nestjs/common';
 import type { Job, Queue } from 'bullmq';
 import { randomUUID } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
@@ -13,7 +8,6 @@ import {
   DLQ_JOB_OPTIONS,
   ERROR_EVENT_DLQ,
   ERROR_EVENT_JOB,
-  ERROR_EVENT_QUEUE,
   toJobId,
   type ErrorEventDlqData,
   type ErrorEventJobData,
@@ -31,9 +25,6 @@ import {
   buildSymbolicatedCulprit,
   computeSymbolicatedFingerprint,
 } from './symbolicate';
-
-/** 单进程并发度。归并是 DB 密集，先给 5；等有真实压测数据再按 PG 连接池上限调 */
-const CONCURRENCY = 5;
 
 /** 消费日志里 message 的截断长度：日志是扫一眼用的，整段 stack 不该进日志 */
 const LOG_MESSAGE_LIMIT = 120;
@@ -75,34 +66,30 @@ interface ClaimOutcome {
 }
 
 /**
- * 归并 Worker 的消费者（W3 骨架 + W4 归并）。
+ * 归并 Worker 的消费逻辑（W3 骨架 + W4 归并；M4-S7 起不再自己挂 Worker）。
  *
  * ── 它现在做什么 ────────────────────────────────────────────────────────
- * 消费 `error-event` job，在**一个事务里**做两件事：
+ * 处理一条 `error-event` job，在**一个事务里**做两件事：
  *   ① 把 error_events.processed_at 从 NULL 原子置位 —— 抢到的那次才继续
  *   ② 算指纹 → upsert error_groups → 回填 error_events.group_id
  * 置位成功 = 这条事件归我处理；置位失败 = 别人（或上一次的自己）已经处理过。
+ *
+ * ── S7 为什么去掉了 @Processor 装饰器 ────────────────────────────────────
+ * `@Processor('error-events')` 只能绑**一个固定队列名**，而 S7 要给每个项目
+ * 建一条 `error-events-<projectId>`。所以这里退化成纯粹的"处理一条 job"，
+ * 由 `ProjectWorkerManager` 按项目创建 Worker，并把 job 递进来。
+ *
+ * 好处是消费逻辑和"监听谁"解耦了：以后再加队列（比如性能指标单独一条），
+ * 只要把 job 递进 `handle()` 就行，归并逻辑一行都不用改。
  *
  * ── 为什么归并必须和声明在同一个事务里 ──────────────────────────────────
  * **不要**把归并挪到事务外面：一旦归并抛错要重试，重试会在声明那一步看到
  * processed_at 已置位而被自己的闸门挡在门外 —— 事件永久丢失，而且不报错，
  * 只在 debug 日志里留一句"已处理过"。放进事务里，回滚会把闸门一起撤销，
  * 重试才有机会重做。
- *
- * ── MVP 有意留空的东西 ──────────────────────────────────────────────────
- *   · users_seen 恒为 0 —— 上报链路里没有 user_id（DTO 与 toRow 都不带）
- *   · first_release / last_release 由上报的 release 填充（SDK 自 M3 起会带上）；
- *     release 为空的事件**不会**把已有的版本列覆盖成 NULL（见 upsert 的 update）
- *   · first_seen 只在 create 时写 —— 乱序到达的旧事件不会把首见时间往前挪。
- *     这是主动接受的近似：要精确得用 LEAST()，而 Prisma 的 upsert 表达不了
- *   · 单项目 —— error_groups 已去掉 project_id（见 schema.prisma 顶部注释）
- *
- * ── 为什么消费逻辑不在 API 进程里 ───────────────────────────────────────
- * 见 grouping.module.ts 的警告：Worker provider 一旦被 app.module.ts 引入，
- * API 进程也会开始抢 job、跑归并，进程分工和扩容就全乱了。
  */
-@Processor(ERROR_EVENT_QUEUE, { concurrency: CONCURRENCY })
-export class ErrorEventProcessor extends WorkerHost {
+@Injectable()
+export class ErrorEventProcessor {
   private readonly logger = new Logger(ErrorEventProcessor.name);
 
   constructor(
@@ -110,9 +97,7 @@ export class ErrorEventProcessor extends WorkerHost {
     @InjectQueue(ERROR_EVENT_DLQ)
     private readonly dlq: Queue<ErrorEventDlqData>,
     private readonly sourcemaps: SourcemapLookupService,
-  ) {
-    super();
-  }
+  ) {}
 
   /**
    * 处理一条事件。
@@ -121,7 +106,7 @@ export class ErrorEventProcessor extends WorkerHost {
    * 3 次用尽后由 onFailed 转 DLQ。所以这里"该抛就抛"：DB 短暂不可用就应该重试，
    * 不要自己吞掉错误假装成功 —— 吞掉等于永久丢失这条事件的归并。
    */
-  async process(job: Job<ErrorEventJobData>): Promise<void> {
+  async handle(job: Job<ErrorEventJobData>): Promise<void> {
     const { eventId } = job.data;
     const outcome = await this.claim(eventId);
 
@@ -311,8 +296,12 @@ export class ErrorEventProcessor extends WorkerHost {
     );
   }
 
-  /** 每一次尝试失败都会触发（含还有重试次数的那几次） */
-  @OnWorkerEvent('failed')
+  /**
+   * 每一次尝试失败都会触发（含还有重试次数的那几次）。
+   *
+   * S7 起由 `ProjectWorkerManager` 给每个 Worker 挂 `worker.on('failed', ...)`
+   * 转发进来 —— 这里去掉装饰器，逻辑一行没改。
+   */
   async onFailed(
     job: Job<ErrorEventJobData> | undefined,
     err: Error,
@@ -362,17 +351,6 @@ export class ErrorEventProcessor extends WorkerHost {
           `原始原因=${err.message} DLQ 错误=${String(dlqErr)}`,
       );
     }
-  }
-
-  /**
-   * Worker 自身的错误（连接断了、反序列化失败……）。
-   *
-   * 不挂这个监听也不会崩（bullmq 的 emit 兜了 try/catch，最坏是 console.error），
-   * 但那样错误就绕过 Nest 的日志体系了，排查时看不见。
-   */
-  @OnWorkerEvent('error')
-  onError(err: Error): void {
-    this.logger.warn(`Worker 异常: ${err.message}`);
   }
 }
 

@@ -2,6 +2,8 @@ import { BullModule, InjectQueue } from '@nestjs/bullmq';
 import { Injectable, Logger, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Queue } from 'bullmq';
+import { ProjectQueueService } from './project-queue.service';
+import { buildRedisConnection } from './redis-connection';
 import { ERROR_EVENT_DLQ, ERROR_EVENT_QUEUE } from './queue.constants';
 
 /**
@@ -72,24 +74,19 @@ class QueueErrorLogger {
       // 这里仍显式声明一次：Worker 是独立进程，配置来源必须自己写清楚，不靠"全局"
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => {
-        const host = config.get<string>('REDIS_HOST') ?? '127.0.0.1';
-        const rawPort = config.get<string>('REDIS_PORT');
-        const port = rawPort ? Number(rawPort) : 6379;
-
-        // 端口写错（REDIS_PORT=abc、空串）时给一条能看懂的错，而不是让 ioredis
-        // 报一个 "connect ECONNREFUSED ::1:NaN" 之类的天书
-        if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-          throw new Error(`REDIS_PORT 不是合法端口: ${String(rawPort)}`);
-        }
-
-        return { connection: { host, port } };
-      },
+      // 连接参数的解析在 redis-connection.ts 里，S7 的每项目 Worker 也调它 ——
+      // 两处各读一遍 env 迟早漂移（生产者写 A 库、消费者读 B 库是最难查的一类错）
+      useFactory: (config: ConfigService) => ({
+        connection: buildRedisConnection({
+          REDIS_HOST: config.get<string>('REDIS_HOST'),
+          REDIS_PORT: config.get<string>('REDIS_PORT'),
+        } as NodeJS.ProcessEnv),
+      }),
     }),
     errorEventQueue,
     errorEventDlq,
   ],
-  providers: [QueueErrorLogger],
-  exports: [errorEventQueue, errorEventDlq],
+  providers: [QueueErrorLogger, ProjectQueueService],
+  exports: [errorEventQueue, errorEventDlq, ProjectQueueService],
 })
 export class QueueModule {}

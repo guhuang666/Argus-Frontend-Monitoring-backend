@@ -4,8 +4,10 @@ import { ConfigModule } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import type { Queue } from 'bullmq';
 import { GroupingModule } from './grouping/grouping.module';
+import { ProjectWorkerManager } from './grouping/project-worker.manager';
 import { PrismaModule } from './prisma/prisma.module';
 import { PrismaService } from './prisma/prisma.service';
+import { ProjectQueueService } from './queue/project-queue.service';
 import { ERROR_EVENT_QUEUE } from './queue/queue.constants';
 import { QueueModule } from './queue/queue.module';
 
@@ -77,12 +79,29 @@ async function bootstrap(): Promise<void> {
   }
 
   // 队列存量一起打出来：验收时"curl 之后 waiting 动了、processed_at 变了"一眼能对上，
-  // 不用另开 redis-cli
-  const counts = await queue.getJobCounts('waiting', 'active', 'delayed', 'failed', 'completed');
-  Logger.log(
-    `归并 Worker 已就绪 → 队列「${ERROR_EVENT_QUEUE}」 ${JSON.stringify(counts)}`,
-    BOOTSTRAP,
-  );
+  // 不用另开 redis-cli。
+  //
+  // S7 起没有"一条全局队列"了 —— 每个项目一条 error-events-<projectId>。
+  // 所以这里遍历 manager 已经启动的那些项目，逐个报存量。
+  const queues = app.get(ProjectQueueService);
+  const listening = app.get(ProjectWorkerManager).listens();
+
+  if (listening.length === 0) {
+    Logger.warn(
+      '归并 Worker 已就绪，但当前没有任何启用的项目（没有队列可消费）',
+      BOOTSTRAP,
+    );
+    return;
+  }
+
+  Logger.log(`归并 Worker 已就绪 → 正在消费 ${listening.length} 个项目的队列`, BOOTSTRAP);
+
+  for (const { projectId, name } of listening) {
+    const counts = await queues
+      .queueFor(projectId)
+      .getJobCounts('waiting', 'active', 'delayed', 'failed', 'completed');
+    Logger.log(`  · 「${name}」 ${JSON.stringify(counts)}`, BOOTSTRAP);
+  }
 }
 
 /**

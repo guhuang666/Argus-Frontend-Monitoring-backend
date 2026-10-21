@@ -20,6 +20,14 @@ export interface RateLimitVerdict {
 const WINDOW_MS = 1000;
 
 /**
+ * 丢件计数在 Redis 里保留多久（7 天）。
+ *
+ * 为什么给 TTL：一个项目停止上报之后，那个 hash 不该永远留着。
+ * 7 天够回答"本周丢了多少"，再长就该进正式聚合表了（M5）。
+ */
+const DROPPED_TTL_SECONDS = 7 * 24 * 3600;
+
+/**
  * 滑动窗口的 Lua 实现（FR-6.1 / FR-6.7）。
  *
  * ── 为什么必须写成整段脚本 ──────────────────────────────────────────────
@@ -131,10 +139,61 @@ export class RateLimitService implements OnModuleDestroy {
   }
 
   /**
+   * 记一次"被限流丢掉"（M4-S7 / FR-6.4）。
+   *
+   * ── 为什么这个计数必须有 ────────────────────────────────────────────────
+   * 客户被限流时，他看到的只是"事件好像变少了"。没有明确数字的话，
+   * 他第一反应是"SDK 坏了"或"看板出问题了"，而不是"我的配额用完了"。
+   * 把这个数字摆到看板上，"被丢了多少"就从猜测变成事实。
+   *
+   * ── 为什么存 Redis hash 而不是建表 ──────────────────────────────────────
+   * 按小时分桶（field = `YYYY-MM-DDTHH`）已经能回答"今天丢了多少"。
+   * 正式的按小时聚合表是 M5 的 `issue_stats_hourly`，到那时把丢件并进去
+   * 更合理；现在建表等于先盖一半再拆。
+   */
+  async recordDropped(projectId: string, count = 1): Promise<void> {
+    try {
+      const key = `rl:dropped:${projectId}`;
+      // toISOString 是 UTC。对"今日丢件数"这种展示级指标，UTC 分桶足够，
+      // 代价是东八区的用户在早上 8 点会看到"今日"重置。
+      const hourBucket = new Date().toISOString().slice(0, 13); // 2026-10-20T14
+      await this.redis.hincrby(key, hourBucket, count);
+      await this.redis.expire(key, DROPPED_TTL_SECONDS);
+    } catch (err) {
+      // 计数失败绝不能让请求失败：它是"观察"，不是"业务"
+      this.logger.warn(`记录丢件数失败（忽略）: project=${projectId} ${String(err)}`);
+    }
+  }
+
+  /**
+   * 今天被限流丢掉了多少条。
+   *
+   * 返回 `null` 表示"查不到"（Redis 不可用）。这与返回 0 是两件事：
+   * 0 是"确实没丢"，null 是"不知道" —— 看板上必须区分，否则会显示成"一切正常"。
+   */
+  async droppedToday(projectId: string): Promise<number | null> {
+    try {
+      const key = `rl:dropped:${projectId}`;
+      const today = new Date().toISOString().slice(0, 10); // 2026-10-20
+      const buckets = await this.redis.hkeys(key);
+      const fields = buckets.filter((bucket) => bucket.startsWith(today));
+      if (fields.length === 0) return 0;
+
+      const values = await this.redis.hmget(key, ...fields);
+      return values.reduce((sum, value) => sum + (value === null ? 0 : Number(value)), 0);
+    } catch (err) {
+      this.logger.warn(`读取丢件数失败: project=${projectId} ${String(err)}`);
+      return null;
+    }
+  }
+
+  /**
    * 版本 B：整段交给 Redis 执行（**准确**，生产用这个）。
    *
-   * ioredis 会自动处理 EVALSHA：第一次发脚本原文，之后用缓存里的 SHA，
-   * 所以不是每次都传 30 行脚本文本。
+   * 注：`redis.eval()` **每次都会把脚本全文发过去**（约 800 字节）。
+   * 想省这部分流量要用 `defineCommand`（ioredis 才会自动改用 EVALSHA，
+   * 之后只发 40 字符的 SHA）。目前的选择是"先保证正确，再谈优化"，
+   * 优化项留给 S8 压测时做对照数据。
    */
   async acquireByLua(
     key: string,

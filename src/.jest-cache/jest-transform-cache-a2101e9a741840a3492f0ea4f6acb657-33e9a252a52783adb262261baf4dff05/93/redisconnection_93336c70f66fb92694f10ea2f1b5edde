@@ -1,0 +1,26 @@
+2bd2895fe81651e8fa30fc30255fddc9
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.buildRedisConnection = buildRedisConnection;
+/**
+ * Redis 连接配置的唯一来源。
+ *
+ * 为什么抽出来：`queue.module.ts` 的 `forRootAsync` 和 S7 的每项目 Worker 都要连
+ * Redis。两处各读一遍 env 迟早会漂移（改了这里忘了那里，表现是"生产者写进 A 库、
+ * 消费者读 B 库"，最难查）。所以只留这一个函数，谁都调它。
+ *
+ * 刻意**不设** maxRetriesPerRequest：BullMQ 要求 Worker 那条阻塞连接的值是 null，
+ * 显式设了会被它覆盖并打 deprecation 警告，不如统一用默认值。
+ */
+function buildRedisConnection(env = process.env) {
+    const host = env.REDIS_HOST ?? '127.0.0.1';
+    const rawPort = env.REDIS_PORT;
+    const port = rawPort ? Number(rawPort) : 6379;
+    // 端口写错（REDIS_PORT=abc、空串）时给一条能看懂的错，
+    // 而不是让 ioredis 报 "connect ECONNREFUSED ::1:NaN" 之类的天书
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+        throw new Error(`REDIS_PORT 不是合法端口: ${String(rawPort)}`);
+    }
+    return { host, port };
+}
+//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJmaWxlIjoiRTpcXEFyZ3VzXFxiYWNrZW5kXFxzcmNcXHF1ZXVlXFxyZWRpcy1jb25uZWN0aW9uLnRzIiwibWFwcGluZ3MiOiI7O0FBWUEsb0RBWUM7QUF0QkQ7Ozs7Ozs7OztHQVNHO0FBQ0gsU0FBZ0Isb0JBQW9CLENBQUMsTUFBeUIsT0FBTyxDQUFDLEdBQUc7SUFDdkUsTUFBTSxJQUFJLEdBQUcsR0FBRyxDQUFDLFVBQVUsSUFBSSxXQUFXLENBQUM7SUFDM0MsTUFBTSxPQUFPLEdBQUcsR0FBRyxDQUFDLFVBQVUsQ0FBQztJQUMvQixNQUFNLElBQUksR0FBRyxPQUFPLENBQUMsQ0FBQyxDQUFDLE1BQU0sQ0FBQyxPQUFPLENBQUMsQ0FBQyxDQUFDLENBQUMsSUFBSSxDQUFDO0lBRTlDLG9DQUFvQztJQUNwQyxzREFBc0Q7SUFDdEQsSUFBSSxDQUFDLE1BQU0sQ0FBQyxTQUFTLENBQUMsSUFBSSxDQUFDLElBQUksSUFBSSxJQUFJLENBQUMsSUFBSSxJQUFJLEdBQUcsS0FBSyxFQUFFLENBQUM7UUFDekQsTUFBTSxJQUFJLEtBQUssQ0FBQyxzQkFBc0IsTUFBTSxDQUFDLE9BQU8sQ0FBQyxFQUFFLENBQUMsQ0FBQztJQUMzRCxDQUFDO0lBRUQsT0FBTyxFQUFFLElBQUksRUFBRSxJQUFJLEVBQUUsQ0FBQztBQUN4QixDQUFDIiwibmFtZXMiOltdLCJzb3VyY2VzIjpbIkU6XFxBcmd1c1xcYmFja2VuZFxcc3JjXFxxdWV1ZVxccmVkaXMtY29ubmVjdGlvbi50cyJdLCJzb3VyY2VzQ29udGVudCI6WyJpbXBvcnQgdHlwZSB7IENvbm5lY3Rpb25PcHRpb25zIH0gZnJvbSAnYnVsbG1xJztcblxuLyoqXG4gKiBSZWRpcyDov57mjqXphY3nva7nmoTllK/kuIDmnaXmupDjgIJcbiAqXG4gKiDkuLrku4DkuYjmir3lh7rmnaXvvJpgcXVldWUubW9kdWxlLnRzYCDnmoQgYGZvclJvb3RBc3luY2Ag5ZKMIFM3IOeahOavj+mhueebriBXb3JrZXIg6YO96KaB6L+eXG4gKiBSZWRpc+OAguS4pOWkhOWQhOivu+S4gOmBjSBlbnYg6L+f5pep5Lya5ryC56e777yI5pS55LqG6L+Z6YeM5b+Y5LqG6YKj6YeM77yM6KGo546w5pivXCLnlJ/kuqfogIXlhpnov5sgQSDlupPjgIFcbiAqIOa2iOi0ueiAheivuyBCIOW6k1wi77yM5pyA6Zq+5p+l77yJ44CC5omA5Lul5Y+q55WZ6L+Z5LiA5Liq5Ye95pWw77yM6LCB6YO96LCD5a6D44CCXG4gKlxuICog5Yi75oSPKirkuI3orr4qKiBtYXhSZXRyaWVzUGVyUmVxdWVzdO+8mkJ1bGxNUSDopoHmsYIgV29ya2VyIOmCo+adoemYu+Whnui/nuaOpeeahOWAvOaYryBudWxs77yMXG4gKiDmmL7lvI/orr7kuobkvJrooqvlroPopobnm5blubbmiZMgZGVwcmVjYXRpb24g6K2m5ZGK77yM5LiN5aaC57uf5LiA55So6buY6K6k5YC844CCXG4gKi9cbmV4cG9ydCBmdW5jdGlvbiBidWlsZFJlZGlzQ29ubmVjdGlvbihlbnY6IE5vZGVKUy5Qcm9jZXNzRW52ID0gcHJvY2Vzcy5lbnYpOiBDb25uZWN0aW9uT3B0aW9ucyB7XG4gIGNvbnN0IGhvc3QgPSBlbnYuUkVESVNfSE9TVCA/PyAnMTI3LjAuMC4xJztcbiAgY29uc3QgcmF3UG9ydCA9IGVudi5SRURJU19QT1JUO1xuICBjb25zdCBwb3J0ID0gcmF3UG9ydCA/IE51bWJlcihyYXdQb3J0KSA6IDYzNzk7XG5cbiAgLy8g56uv5Y+j5YaZ6ZSZ77yIUkVESVNfUE9SVD1hYmPjgIHnqbrkuLLvvInml7bnu5nkuIDmnaHog73nnIvmh4LnmoTplJnvvIxcbiAgLy8g6ICM5LiN5piv6K6pIGlvcmVkaXMg5oqlIFwiY29ubmVjdCBFQ09OTlJFRlVTRUQgOjoxOk5hTlwiIOS5i+exu+eahOWkqeS5plxuICBpZiAoIU51bWJlci5pc0ludGVnZXIocG9ydCkgfHwgcG9ydCA8PSAwIHx8IHBvcnQgPiA2NTUzNSkge1xuICAgIHRocm93IG5ldyBFcnJvcihgUkVESVNfUE9SVCDkuI3mmK/lkIjms5Xnq6/lj6M6ICR7U3RyaW5nKHJhd1BvcnQpfWApO1xuICB9XG5cbiAgcmV0dXJuIHsgaG9zdCwgcG9ydCB9O1xufVxuIl0sInZlcnNpb24iOjN9

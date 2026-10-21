@@ -1,0 +1,104 @@
+0166fe75d9ab14d64f76833944c470ad
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DLQ_JOB_OPTIONS = exports.ERROR_EVENT_JOB_OPTIONS = exports.ERROR_EVENT_JOB = exports.ERROR_EVENT_DLQ = exports.ERROR_EVENT_QUEUE = void 0;
+exports.projectQueueName = projectQueueName;
+exports.toJobId = toJobId;
+/**
+ * 队列契约（W3）—— 生产者（ingest）与消费者（worker）共用这一份常量。
+ *
+ * 单独成文件是为了避免"生产者 import 消费者的模块"这种反向依赖：
+ * 两边都只依赖契约，谁也不知道谁的存在。
+ */
+/**
+ * 归并队列的**名字前缀**（M4-S7 起）。
+ *
+ * 以前所有项目共用一条 `error-events`；现在每个项目一条
+ * `error-events:<projectId>`，用 `projectQueueName()` 拼。
+ * 这条基础队列本身已经不再承载 job，保留它有两个用途：
+ *   · 作为"连接配置的锚点"（`queue.opts.connection` 拷给动态创建的队列）
+ *   · 启动时探测 Redis 是否就绪
+ */
+exports.ERROR_EVENT_QUEUE = 'error-events';
+/**
+ * 按项目隔离的队列名（M4-S7 / FR-6.6）。
+ *
+ * ── 为什么按项目分队列 ──────────────────────────────────────────────────
+ * 单队列时，A 项目灌 10 万条进来，B 项目的 3 条就排在队尾 —— B 付了钱，
+ * 却因为 A 被攻击而看不到自己的报错。分队列之后，A 的积压只影响 A。
+ *
+ * ── 为什么队列名带上项目 id 就够了 ──────────────────────────────────────
+ * BullMQ 的队列是"按名字隔离"的：不同名字的队列有各自独立的 key、
+ * 各自的 Worker、各自的并发度。所以"隔离"不需要额外机制，只需要换个名字。
+ */
+function projectQueueName(projectId) {
+    return `${exports.ERROR_EVENT_QUEUE}:${projectId}`;
+}
+/**
+ * 死信队列（DLQ）：重试耗尽后转入。
+ *
+ * **注意它现在没有消费者** —— 只是把失败现场留一份，等重驱动任务（W8 或后续里程碑）
+ * 来捞。另注：docker-compose 里的 redis 没有挂卷，重启即丢，所以这份 DLQ 是"开发期
+ * 够用"而不是"审计级可靠"。要做到重启不丢，得换成 PG 表（见 W3 交接说明）。
+ */
+exports.ERROR_EVENT_DLQ = 'error-events-dlq';
+/** job 名。队列名回答"哪个队列"，job 名回答"干什么"：一个队列以后可能装多种 job */
+exports.ERROR_EVENT_JOB = 'error-event';
+/**
+ * 工作 job 的默认选项。
+ *
+ * attempts: 3 —— 是**总次数**不是重试次数：首次 + 2 次重试。
+ *   backoff exponential delay 1000 → 第 2 次隔 1s，第 3 次隔 2s。
+ *
+ * removeOnComplete 留 1 小时 / 最多 5000 条：保留窗口 = jobId 去重的有效窗口。
+ *   队列里的 job 一旦被删，同 jobId 就能再次入队 —— 留一小时是为了让"SDK 重复上报
+ *   同一事件"落在窗口内被静默忽略，同时不让 Redis 无限长。
+ *
+ * removeOnFail: true —— 失败 job 立刻删掉，原因有两条：
+ *   ① 失败现场已经由 DLQ 存了一份，这份留着是重复的；
+ *   ② 更要紧的是**别把补扫堵死**：失败 job 如果留在 failed 集合里，W8 的补扫按
+ *      event_id 重新入队时会被 jobId 去重静默吃掉，那条事件就永远处理不了了。
+ *      删掉它，补扫才有机会重来。
+ *
+ * 注：真正的幂等闸门不是 jobId 而是 error_events.processed_at（见 processor），
+ * jobId 只是省掉重复劳动的第一道闸。
+ */
+exports.ERROR_EVENT_JOB_OPTIONS = {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 1000 },
+    removeOnComplete: { age: 3600, count: 5000 },
+    removeOnFail: true,
+};
+/**
+ * DLQ job 选项：不重试、不自动清理。
+ *
+ * 不清理是刻意的 —— DLQ 的价值就在于"东西还在那儿"，清理策略要等重驱动任务
+ * 落地时一起定（保住多久、重驱动几次后归档）。
+ */
+exports.DLQ_JOB_OPTIONS = {
+    removeOnComplete: false,
+    removeOnFail: false,
+};
+/**
+ * event_id → BullMQ 的 jobId。
+ *
+ * 直接用 event_id 是最理想的（排查时 jobId 就是事件主键），但 BullMQ 6 对自定义
+ * jobId 有两条硬校验（`bullmq/dist/cjs/classes/job.js:904-914`），踩中会**抛异常**、
+ * 直接把入队打回来：
+ *   · 纯整数形式的字符串 → `Custom Id cannot be integers`（如 event_id = "12345"）
+ *   · 含 `:` 且不是正好 3 段   → `Custom Id cannot contain :`
+ *
+ * SDK 生成的 id 是 UUID 或十六进制串，两条都不沾；但 `POST /api/v1/error` 是对公网
+ * 开放的，DTO 只校验"1~128 个字符"，第三方客户端发什么形状都收得下。所以这里做一次
+ * 映射，把非法形状挡在入队之前：
+ *   · `%` 先编码成 `%25`，再把 `:` 编码成 `%3A` —— 映射是单射（`a:b` 与 `a_b` 不会
+ *     互相顶掉），且不再含冒号
+ *   · 纯数字前面加 `e-`（带字母后 parseInt 得 NaN，整数校验必过）
+ *
+ * 常规 id（UUID）原样返回，jobId 依然等于 event_id。
+ */
+function toJobId(eventId) {
+    const encoded = eventId.replace(/%/g, '%25').replace(/:/g, '%3A');
+    return /^\d+$/.test(encoded) ? `e-${encoded}` : encoded;
+}
+//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJmaWxlIjoiRTpcXEFyZ3VzXFxiYWNrZW5kXFxzcmNcXHF1ZXVlXFxxdWV1ZS5jb25zdGFudHMudHMiLCJtYXBwaW5ncyI6Ijs7O0FBK0JBLDRDQUVDO0FBMEZELDBCQUdDO0FBNUhEOzs7OztHQUtHO0FBRUg7Ozs7Ozs7O0dBUUc7QUFDVSxRQUFBLGlCQUFpQixHQUFHLGNBQWMsQ0FBQztBQUVoRDs7Ozs7Ozs7OztHQVVHO0FBQ0gsU0FBZ0IsZ0JBQWdCLENBQUMsU0FBaUI7SUFDaEQsT0FBTyxHQUFHLHlCQUFpQixJQUFJLFNBQVMsRUFBRSxDQUFDO0FBQzdDLENBQUM7QUFFRDs7Ozs7O0dBTUc7QUFDVSxRQUFBLGVBQWUsR0FBRyxrQkFBa0IsQ0FBQztBQUVsRCxxREFBcUQ7QUFDeEMsUUFBQSxlQUFlLEdBQUcsYUFBYSxDQUFDO0FBdUI3Qzs7Ozs7Ozs7Ozs7Ozs7Ozs7O0dBa0JHO0FBQ1UsUUFBQSx1QkFBdUIsR0FBZ0I7SUFDbEQsUUFBUSxFQUFFLENBQUM7SUFDWCxPQUFPLEVBQUUsRUFBRSxJQUFJLEVBQUUsYUFBYSxFQUFFLEtBQUssRUFBRSxJQUFJLEVBQUU7SUFDN0MsZ0JBQWdCLEVBQUUsRUFBRSxHQUFHLEVBQUUsSUFBSSxFQUFFLEtBQUssRUFBRSxJQUFJLEVBQUU7SUFDNUMsWUFBWSxFQUFFLElBQUk7Q0FDbkIsQ0FBQztBQUVGOzs7OztHQUtHO0FBQ1UsUUFBQSxlQUFlLEdBQWdCO0lBQzFDLGdCQUFnQixFQUFFLEtBQUs7SUFDdkIsWUFBWSxFQUFFLEtBQUs7Q0FDcEIsQ0FBQztBQUVGOzs7Ozs7Ozs7Ozs7Ozs7OztHQWlCRztBQUNILFNBQWdCLE9BQU8sQ0FBQyxPQUFlO0lBQ3JDLE1BQU0sT0FBTyxHQUFHLE9BQU8sQ0FBQyxPQUFPLENBQUMsSUFBSSxFQUFFLEtBQUssQ0FBQyxDQUFDLE9BQU8sQ0FBQyxJQUFJLEVBQUUsS0FBSyxDQUFDLENBQUM7SUFDbEUsT0FBTyxPQUFPLENBQUMsSUFBSSxDQUFDLE9BQU8sQ0FBQyxDQUFDLENBQUMsQ0FBQyxLQUFLLE9BQU8sRUFBRSxDQUFDLENBQUMsQ0FBQyxPQUFPLENBQUM7QUFDMUQsQ0FBQyIsIm5hbWVzIjpbXSwic291cmNlcyI6WyJFOlxcQXJndXNcXGJhY2tlbmRcXHNyY1xccXVldWVcXHF1ZXVlLmNvbnN0YW50cy50cyJdLCJzb3VyY2VzQ29udGVudCI6WyJpbXBvcnQgdHlwZSB7IEpvYnNPcHRpb25zIH0gZnJvbSAnYnVsbG1xJztcblxuLyoqXG4gKiDpmJ/liJflpZHnuqbvvIhXM++8ieKAlOKAlCDnlJ/kuqfogIXvvIhpbmdlc3TvvInkuI7mtojotLnogIXvvIh3b3JrZXLvvInlhbHnlKjov5nkuIDku73luLjph4/jgIJcbiAqXG4gKiDljZXni6zmiJDmlofku7bmmK/kuLrkuobpgb/lhY1cIueUn+S6p+iAhSBpbXBvcnQg5raI6LS56ICF55qE5qih5Z2XXCLov5nnp43lj43lkJHkvp3otZbvvJpcbiAqIOS4pOi+uemDveWPquS+nei1luWlkee6pu+8jOiwgeS5n+S4jeefpemBk+iwgeeahOWtmOWcqOOAglxuICovXG5cbi8qKlxuICog5b2S5bm26Zif5YiX55qEKirlkI3lrZfliY3nvIAqKu+8iE00LVM3IOi1t++8ieOAglxuICpcbiAqIOS7peWJjeaJgOaciemhueebruWFseeUqOS4gOadoSBgZXJyb3ItZXZlbnRzYO+8m+eOsOWcqOavj+S4qumhueebruS4gOadoVxuICogYGVycm9yLWV2ZW50czo8cHJvamVjdElkPmDvvIznlKggYHByb2plY3RRdWV1ZU5hbWUoKWAg5ou844CCXG4gKiDov5nmnaHln7rnoYDpmJ/liJfmnKzouqvlt7Lnu4/kuI3lho3mib/ovb0gam9i77yM5L+d55WZ5a6D5pyJ5Lik5Liq55So6YCU77yaXG4gKiAgIMK3IOS9nOS4ulwi6L+e5o6l6YWN572u55qE6ZSa54K5XCLvvIhgcXVldWUub3B0cy5jb25uZWN0aW9uYCDmi7fnu5nliqjmgIHliJvlu7rnmoTpmJ/liJfvvIlcbiAqICAgwrcg5ZCv5Yqo5pe25o6i5rWLIFJlZGlzIOaYr+WQpuWwsee7qlxuICovXG5leHBvcnQgY29uc3QgRVJST1JfRVZFTlRfUVVFVUUgPSAnZXJyb3ItZXZlbnRzJztcblxuLyoqXG4gKiDmjInpobnnm67pmpTnprvnmoTpmJ/liJflkI3vvIhNNC1TNyAvIEZSLTYuNu+8ieOAglxuICpcbiAqIOKUgOKUgCDkuLrku4DkuYjmjInpobnnm67liIbpmJ/liJcg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4gKiDljZXpmJ/liJfml7bvvIxBIOmhueebrueBjCAxMCDkuIfmnaHov5vmnaXvvIxCIOmhueebrueahCAzIOadoeWwseaOkuWcqOmYn+WwviDigJTigJQgQiDku5jkuobpkrHvvIxcbiAqIOWNtOWboOS4uiBBIOiiq+aUu+WHu+iAjOeci+S4jeWIsOiHquW3seeahOaKpemUmeOAguWIhumYn+WIl+S5i+WQju+8jEEg55qE56ev5Y6L5Y+q5b2x5ZONIEHjgIJcbiAqXG4gKiDilIDilIAg5Li65LuA5LmI6Zif5YiX5ZCN5bim5LiK6aG555uuIGlkIOWwseWkn+S6hiDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIBcbiAqIEJ1bGxNUSDnmoTpmJ/liJfmmK9cIuaMieWQjeWtl+malOemu1wi55qE77ya5LiN5ZCM5ZCN5a2X55qE6Zif5YiX5pyJ5ZCE6Ieq54us56uL55qEIGtleeOAgVxuICog5ZCE6Ieq55qEIFdvcmtlcuOAgeWQhOiHqueahOW5tuWPkeW6puOAguaJgOS7pVwi6ZqU56a7XCLkuI3pnIDopoHpop3lpJbmnLrliLbvvIzlj6rpnIDopoHmjaLkuKrlkI3lrZfjgIJcbiAqL1xuZXhwb3J0IGZ1bmN0aW9uIHByb2plY3RRdWV1ZU5hbWUocHJvamVjdElkOiBzdHJpbmcpOiBzdHJpbmcge1xuICByZXR1cm4gYCR7RVJST1JfRVZFTlRfUVVFVUV9OiR7cHJvamVjdElkfWA7XG59XG5cbi8qKlxuICog5q275L+h6Zif5YiX77yIRExR77yJ77ya6YeN6K+V6ICX5bC95ZCO6L2s5YWl44CCXG4gKlxuICogKirms6jmhI/lroPnjrDlnKjmsqHmnInmtojotLnogIUqKiDigJTigJQg5Y+q5piv5oqK5aSx6LSl546w5Zy655WZ5LiA5Lu977yM562J6YeN6amx5Yqo5Lu75Yqh77yIVzgg5oiW5ZCO57ut6YeM56iL56KR77yJXG4gKiDmnaXmjZ7jgILlj6bms6jvvJpkb2NrZXItY29tcG9zZSDph4znmoQgcmVkaXMg5rKh5pyJ5oyC5Y2377yM6YeN5ZCv5Y2z5Lii77yM5omA5Lul6L+Z5Lu9IERMUSDmmK9cIuW8gOWPkeacn1xuICog5aSf55SoXCLogIzkuI3mmK9cIuWuoeiuoee6p+WPr+mdoFwi44CC6KaB5YGa5Yiw6YeN5ZCv5LiN5Lii77yM5b6X5o2i5oiQIFBHIOihqO+8iOingSBXMyDkuqTmjqXor7TmmI7vvInjgIJcbiAqL1xuZXhwb3J0IGNvbnN0IEVSUk9SX0VWRU5UX0RMUSA9ICdlcnJvci1ldmVudHMtZGxxJztcblxuLyoqIGpvYiDlkI3jgILpmJ/liJflkI3lm57nrZRcIuWTquS4qumYn+WIl1wi77yMam9iIOWQjeWbnuetlFwi5bmy5LuA5LmIXCLvvJrkuIDkuKrpmJ/liJfku6XlkI7lj6/og73oo4XlpJrnp40gam9iICovXG5leHBvcnQgY29uc3QgRVJST1JfRVZFTlRfSk9CID0gJ2Vycm9yLWV2ZW50JztcblxuLyoqXG4gKiDlt6XkvZwgam9iIOeahOi9veiNt++8mioq5Y+q5bim5Li76ZSuKirjgIJcbiAqXG4gKiDmmI7nu4bvvIh0eXBlIC8gbWVzc2FnZSAvIHN0YWNr77yJ5LuOIFBHIOeOsOivu++8jOS4jeWcqCBSZWRpcyDph4zlrZjnrKzkuozku70g4oCU4oCUIOWQpuWImeS6i+S7tuWcqFxuICog5YWl5bqT5ZCO6KKr5L+u5q2j44CB5oiW6ICFIHNjaGVtYSDmvJTov5vml7bvvIzpmJ/liJfph4zpgqPku73lsLHmiJDkuobov4fmnJ/nnJ/nm7jjgILovb3ojbflsI/ov5jmnInkuKrlia/kvZznlKhcbiAqIOaYr+WlveS6i++8mmpvYiDotorlsI/vvIxSZWRpcyDlhoXlrZjlkoznvZHnu5zlvIDplIDotorkvY7jgIJcbiAqL1xuZXhwb3J0IGludGVyZmFjZSBFcnJvckV2ZW50Sm9iRGF0YSB7XG4gIGV2ZW50SWQ6IHN0cmluZztcbn1cblxuLyoqIOatu+S/oei9veiNt++8muWOn+i9veiNtyArIOWksei0peeOsOWcuu+8jOWkn+S6i+WQjuWumuS9jeWwseihjCAqL1xuZXhwb3J0IGludGVyZmFjZSBFcnJvckV2ZW50RGxxRGF0YSBleHRlbmRzIEVycm9yRXZlbnRKb2JEYXRhIHtcbiAgLyoqIOacgOWQjuS4gOasoeWksei0peeahOWOn+WboO+8iEVycm9yLm1lc3NhZ2XvvIkgKi9cbiAgZmFpbGVkUmVhc29uOiBzdHJpbmc7XG4gIC8qKiDkuIDlhbHlsJ3or5Xkuoblh6DmrKHvvIjnrYnkuo4gYXR0ZW1wdHPvvIzlm6DkuLrlj6rmnInph43or5XogJflsL3miY3kvJrov5sgRExR77yJICovXG4gIGF0dGVtcHRzTWFkZTogbnVtYmVyO1xuICAvKiog6L2s5YWlIERMUSDnmoTml7bpl7TvvIhJU08g5a2X56ym5Liy77ybUmVkaXMg6YeM5LiN5a2YIERhdGXvvIkgKi9cbiAgZmFpbGVkQXQ6IHN0cmluZztcbn1cblxuLyoqXG4gKiDlt6XkvZwgam9iIOeahOm7mOiupOmAiemhueOAglxuICpcbiAqIGF0dGVtcHRzOiAzIOKAlOKAlCDmmK8qKuaAu+asoeaVsCoq5LiN5piv6YeN6K+V5qyh5pWw77ya6aaW5qyhICsgMiDmrKHph43or5XjgIJcbiAqICAgYmFja29mZiBleHBvbmVudGlhbCBkZWxheSAxMDAwIOKGkiDnrKwgMiDmrKHpmpQgMXPvvIznrKwgMyDmrKHpmpQgMnPjgIJcbiAqXG4gKiByZW1vdmVPbkNvbXBsZXRlIOeVmSAxIOWwj+aXtiAvIOacgOWkmiA1MDAwIOadoe+8muS/neeVmeeql+WPoyA9IGpvYklkIOWOu+mHjeeahOacieaViOeql+WPo+OAglxuICogICDpmJ/liJfph4znmoQgam9iIOS4gOaXpuiiq+WIoO+8jOWQjCBqb2JJZCDlsLHog73lho3mrKHlhaXpmJ8g4oCU4oCUIOeVmeS4gOWwj+aXtuaYr+S4uuS6huiuqVwiU0RLIOmHjeWkjeS4iuaKpVxuICogICDlkIzkuIDkuovku7ZcIuiQveWcqOeql+WPo+WGheiiq+mdmem7mOW/veeVpe+8jOWQjOaXtuS4jeiuqSBSZWRpcyDml6DpmZDplb/jgIJcbiAqXG4gKiByZW1vdmVPbkZhaWw6IHRydWUg4oCU4oCUIOWksei0pSBqb2Ig56uL5Yi75Yig5o6J77yM5Y6f5Zug5pyJ5Lik5p2h77yaXG4gKiAgIOKRoCDlpLHotKXnjrDlnLrlt7Lnu4/nlLEgRExRIOWtmOS6huS4gOS7ve+8jOi/meS7veeVmeedgOaYr+mHjeWkjeeahO+8m1xuICogICDikaEg5pu06KaB57Sn55qE5pivKirliKvmiorooaXmiavloLXmrbsqKu+8muWksei0pSBqb2Ig5aaC5p6c55WZ5ZyoIGZhaWxlZCDpm4blkIjph4zvvIxXOCDnmoTooaXmiavmjIlcbiAqICAgICAgZXZlbnRfaWQg6YeN5paw5YWl6Zif5pe25Lya6KKrIGpvYklkIOWOu+mHjemdmem7mOWQg+aOie+8jOmCo+adoeS6i+S7tuWwseawuOi/nOWkhOeQhuS4jeS6huS6huOAglxuICogICAgICDliKDmjonlroPvvIzooaXmiavmiY3mnInmnLrkvJrph43mnaXjgIJcbiAqXG4gKiDms6jvvJrnnJ/mraPnmoTluYLnrYnpl7jpl6jkuI3mmK8gam9iSWQg6ICM5pivIGVycm9yX2V2ZW50cy5wcm9jZXNzZWRfYXTvvIjop4EgcHJvY2Vzc29y77yJ77yMXG4gKiBqb2JJZCDlj6rmmK/nnIHmjonph43lpI3lirPliqjnmoTnrKzkuIDpgZPpl7jjgIJcbiAqL1xuZXhwb3J0IGNvbnN0IEVSUk9SX0VWRU5UX0pPQl9PUFRJT05TOiBKb2JzT3B0aW9ucyA9IHtcbiAgYXR0ZW1wdHM6IDMsXG4gIGJhY2tvZmY6IHsgdHlwZTogJ2V4cG9uZW50aWFsJywgZGVsYXk6IDEwMDAgfSxcbiAgcmVtb3ZlT25Db21wbGV0ZTogeyBhZ2U6IDM2MDAsIGNvdW50OiA1MDAwIH0sXG4gIHJlbW92ZU9uRmFpbDogdHJ1ZSxcbn07XG5cbi8qKlxuICogRExRIGpvYiDpgInpobnvvJrkuI3ph43or5XjgIHkuI3oh6rliqjmuIXnkIbjgIJcbiAqXG4gKiDkuI3muIXnkIbmmK/liLvmhI/nmoQg4oCU4oCUIERMUSDnmoTku7flgLzlsLHlnKjkuo5cIuS4nOilv+i/mOWcqOmCo+WEv1wi77yM5riF55CG562W55Wl6KaB562J6YeN6amx5Yqo5Lu75YqhXG4gKiDokL3lnLDml7bkuIDotbflrprvvIjkv53kvY/lpJrkuYXjgIHph43pqbHliqjlh6DmrKHlkI7lvZLmoaPvvInjgIJcbiAqL1xuZXhwb3J0IGNvbnN0IERMUV9KT0JfT1BUSU9OUzogSm9ic09wdGlvbnMgPSB7XG4gIHJlbW92ZU9uQ29tcGxldGU6IGZhbHNlLFxuICByZW1vdmVPbkZhaWw6IGZhbHNlLFxufTtcblxuLyoqXG4gKiBldmVudF9pZCDihpIgQnVsbE1RIOeahCBqb2JJZOOAglxuICpcbiAqIOebtOaOpeeUqCBldmVudF9pZCDmmK/mnIDnkIbmg7PnmoTvvIjmjpLmn6Xml7Ygam9iSWQg5bCx5piv5LqL5Lu25Li76ZSu77yJ77yM5L2GIEJ1bGxNUSA2IOWvueiHquWumuS5iVxuICogam9iSWQg5pyJ5Lik5p2h56Gs5qCh6aqM77yIYGJ1bGxtcS9kaXN0L2Nqcy9jbGFzc2VzL2pvYi5qczo5MDQtOTE0YO+8ie+8jOi4qeS4reS8mioq5oqb5byC5bi4KirjgIFcbiAqIOebtOaOpeaKiuWFpemYn+aJk+Wbnuadpe+8mlxuICogICDCtyDnuq/mlbTmlbDlvaLlvI/nmoTlrZfnrKbkuLIg4oaSIGBDdXN0b20gSWQgY2Fubm90IGJlIGludGVnZXJzYO+8iOWmgiBldmVudF9pZCA9IFwiMTIzNDVcIu+8iVxuICogICDCtyDlkKsgYDpgIOS4lOS4jeaYr+ato+WlvSAzIOautSAgIOKGkiBgQ3VzdG9tIElkIGNhbm5vdCBjb250YWluIDpgXG4gKlxuICogU0RLIOeUn+aIkOeahCBpZCDmmK8gVVVJRCDmiJbljYHlha3ov5vliLbkuLLvvIzkuKTmnaHpg73kuI3msr7vvJvkvYYgYFBPU1QgL2FwaS92MS9lcnJvcmAg5piv5a+55YWs572RXG4gKiDlvIDmlL7nmoTvvIxEVE8g5Y+q5qCh6aqMXCIxfjEyOCDkuKrlrZfnrKZcIu+8jOesrOS4ieaWueWuouaIt+err+WPkeS7gOS5iOW9oueKtumDveaUtuW+l+S4i+OAguaJgOS7pei/memHjOWBmuS4gOasoVxuICog5pig5bCE77yM5oqK6Z2e5rOV5b2i54q25oyh5Zyo5YWl6Zif5LmL5YmN77yaXG4gKiAgIMK3IGAlYCDlhYjnvJbnoIHmiJAgYCUyNWDvvIzlho3mioogYDpgIOe8lueggeaIkCBgJTNBYCDigJTigJQg5pig5bCE5piv5Y2V5bCE77yIYGE6YmAg5LiOIGBhX2JgIOS4jeS8mlxuICogICAgIOS6kuebuOmhtuaOie+8ie+8jOS4lOS4jeWGjeWQq+WGkuWPt1xuICogICDCtyDnuq/mlbDlrZfliY3pnaLliqAgYGUtYO+8iOW4puWtl+avjeWQjiBwYXJzZUludCDlvpcgTmFO77yM5pW05pWw5qCh6aqM5b+F6L+H77yJXG4gKlxuICog5bi46KeEIGlk77yIVVVJRO+8ieWOn+agt+i/lOWbnu+8jGpvYklkIOS+neeEtuetieS6jiBldmVudF9pZOOAglxuICovXG5leHBvcnQgZnVuY3Rpb24gdG9Kb2JJZChldmVudElkOiBzdHJpbmcpOiBzdHJpbmcge1xuICBjb25zdCBlbmNvZGVkID0gZXZlbnRJZC5yZXBsYWNlKC8lL2csICclMjUnKS5yZXBsYWNlKC86L2csICclM0EnKTtcbiAgcmV0dXJuIC9eXFxkKyQvLnRlc3QoZW5jb2RlZCkgPyBgZS0ke2VuY29kZWR9YCA6IGVuY29kZWQ7XG59XG4iXSwidmVyc2lvbiI6M30=

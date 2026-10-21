@@ -7,8 +7,37 @@ import type { JobsOptions } from 'bullmq';
  * 两边都只依赖契约，谁也不知道谁的存在。
  */
 
-/** 归并工作队列：ingest 入队，Worker 消费 */
+/**
+ * 归并队列的**名字前缀**（M4-S7 起）。
+ *
+ * 以前所有项目共用一条 `error-events`；现在每个项目一条
+ * `error-events-<projectId>`，用 `projectQueueName()` 拼。
+ * 这条基础队列本身已经不再承载 job，保留它有两个用途：
+ *   · 作为"连接配置的锚点"（`queue.opts.connection` 拷给动态创建的队列）
+ *   · 启动时探测 Redis 是否就绪
+ */
 export const ERROR_EVENT_QUEUE = 'error-events';
+
+/**
+ * 按项目隔离的队列名（M4-S7 / FR-6.6）。
+ *
+ * ── 为什么按项目分队列 ──────────────────────────────────────────────────
+ * 单队列时，A 项目灌 10 万条进来，B 项目的 3 条就排在队尾 —— B 付了钱，
+ * 却因为 A 被攻击而看不到自己的报错。分队列之后，A 的积压只影响 A。
+ *
+ * ── 为什么队列名带上项目 id 就够了 ──────────────────────────────────────
+ * BullMQ 的队列是"按名字隔离"的：不同名字的队列有各自独立的 key、
+ * 各自的 Worker、各自的并发度。所以"隔离"不需要额外机制，只需要换个名字。
+ *
+ * ── ⚠️ 分隔符必须是 `-`，不能用 `:` ─────────────────────────────────────
+ * BullMQ 用 `:` 拼 Redis key（`bull:队列名:wait`），所以它**禁止**队列名
+ * 里出现冒号 —— 传进去会直接抛 `Error: Queue name cannot contain :`，
+ * 而且是在 `new Queue()` 那一刻抛，整个 sync 循环失败。
+ * （实测踩过：第一版写成 `error-events-<id>`，worker 启动即报错。）
+ */
+export function projectQueueName(projectId: string): string {
+  return `${ERROR_EVENT_QUEUE}-${projectId}`;
+}
 
 /**
  * 死信队列（DLQ）：重试耗尽后转入。
