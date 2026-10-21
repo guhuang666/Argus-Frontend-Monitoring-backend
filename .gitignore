@@ -56,6 +56,14 @@ pids
 # 不入库：单个动辄几 MB，且随时可由 CLI 重新上传；DB 只存相对路径
 /uploads/
 
+# Jest 的转换缓存（含大量 .map）
+# 这些是"跑测试时自动生成"的中间产物：文件名带内容哈希，源码一动就换一批。
+# 跟踪它们的后果是每次改代码后再提交，都会混进一堆无关的 .map ——
+# 机器相关、可随时重建，不该进仓库。
+# 注：仅写这一行不够 —— 已经被 git 跟踪的文件不会因为 .gitignore 而停止跟踪，
+# 需要配合一次 `git rm -r --cached src/.jest-cache` 把它们从索引里摘出来。
+.jest-cache/
+
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
