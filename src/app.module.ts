@@ -11,6 +11,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { ProjectsModule } from './projects/projects.module';
 import { RateLimitModule } from './ratelimit/ratelimit.module';
 import { SourcemapsModule } from './sourcemaps/sourcemaps.module';
+import { StatsModule } from './stats/stats.module';
 
 @Module({
   imports: [
@@ -38,6 +39,8 @@ import { SourcemapsModule } from './sourcemaps/sourcemaps.module';
     // Sourcemap 上传（M3）。同样只在 API 进程 —— 落盘/入库发生在 HTTP 请求里，
     // worker 只需要"读"已存好的 map，那是另一个模块的事。
     SourcemapsModule,
+    // 概览统计（批次 C）：趋势 + 总量 + 问题数，全部读 issue_stats_hourly。
+    StatsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
