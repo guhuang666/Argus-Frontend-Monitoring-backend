@@ -93,6 +93,16 @@ function fakePrisma(behavior: {
    * FR-4.8 的状态回归、以及 users_seen 的原子自增，需要能分别断言。
    */
   const groupUpdates: Array<{ data: Record<string, unknown> }> = [];
+  /**
+   * M5/B2：小时聚合 upsert 的全部入参。
+   * 断言点有两类：① 桶值算得对不对（hour 必须是 UTC 整点）
+   * ② 有没有用 increment —— 用读改写的话并发下事件数会丢，这正是 B2 要防的。
+   */
+  const statUpserts: Array<{
+    where: Record<string, unknown>;
+    create: Record<string, unknown>;
+    update: Record<string, unknown>;
+  }> = [];
 
   return {
     calls,
@@ -115,6 +125,10 @@ function fakePrisma(behavior: {
     /** 去重表写入的入参 */
     get affectedArgs() {
       return affectedArgs;
+    },
+    /** 小时聚合 upsert 的全部入参（M5/B2） */
+    get statUpserts() {
+      return statUpserts;
     },
     $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
       calls.push('tx:begin');
@@ -154,6 +168,20 @@ function fakePrisma(behavior: {
             calls.push('tx:affectedUser');
             affectedArgs = args as { data: Array<Record<string, unknown>> };
             return { count: behavior.affectedInserted ?? 1 };
+          },
+        },
+        // M5/B2 小时聚合。真实实现是 INSERT ... ON CONFLICT DO UPDATE
+        issueStatHourly: {
+          upsert: async (args: unknown) => {
+            calls.push('tx:upsertStat');
+            statUpserts.push(
+              args as {
+                where: Record<string, unknown>;
+                create: Record<string, unknown>;
+                update: Record<string, unknown>;
+              },
+            );
+            return {};
           },
         },
         errorEvent: {
@@ -307,11 +335,12 @@ describe('ErrorEventProcessor', () => {
 
       await build(prisma, dlq).handle(jobLike({}));
 
-      // 顺序即证明：归并两步都发生在 tx:begin 之后，没有被挪到事务外
+      // 顺序即证明：归并三步都发生在 tx:begin 之后，没有被挪到事务外
       expect(prisma.calls).toEqual([
         'tx:begin',
         'tx:claim',
         'tx:upsertGroup',
+        'tx:upsertStat',
         'tx:updateEvent',
       ]);
 
@@ -406,6 +435,7 @@ describe('ErrorEventProcessor', () => {
         'tx:claim',
         'tx:upsertGroup',
         'tx:regressGroup',
+        'tx:upsertStat',
         'tx:updateEvent',
       ]);
       expect(prisma.groupUpdateArgs?.data).toMatchObject({
@@ -436,6 +466,7 @@ describe('ErrorEventProcessor', () => {
       await build(prisma, fakeDlq()).handle(jobLike({}));
 
       expect(prisma.calls).not.toContain('tx:upsertGroup');
+      expect(prisma.calls).not.toContain('tx:upsertStat');
       expect(prisma.calls).not.toContain('tx:updateEvent');
       expect(prisma.upsertArgs).toBeNull();
     });
@@ -527,6 +558,95 @@ describe('ErrorEventProcessor', () => {
         userKey: 'u_bob',
         firstRelease: 'web@1.2.0',
       });
+    });
+  });
+
+  describe('小时聚合（M5 / B2）', () => {
+    it('每次归并都 upsert 一个小时候，eventCount 用 increment', async () => {
+      const prisma = fakePrisma({ claimed: CLAIMED });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      expect(prisma.calls).toContain('tx:upsertStat');
+      expect(prisma.statUpserts).toHaveLength(1);
+
+      const [stat] = prisma.statUpserts;
+      // 必须用 increment：读改写会在并发下丢计数（B2 的核心风险）
+      expect(stat.update).toMatchObject({ eventCount: { increment: 1 } });
+      // create 分支从 1 开始，而不是 0
+      expect(stat.create).toMatchObject({ eventCount: 1 });
+      expect(stat.where).toMatchObject({
+        projectId_groupId_hour: {
+          projectId: TEST_PROJECT,
+          groupId: 'group-1',
+        },
+      });
+    });
+
+    it('桶值截断到 UTC 整点（不是把原始时间塞进去）', async () => {
+      const prisma = fakePrisma({
+        claimed: {
+          ...CLAIMED,
+          timestamp: new Date('2026-01-01T13:37:41.512Z'),
+        },
+      });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      const where = prisma.statUpserts[0].where as {
+        projectId_groupId_hour: { hour: Date };
+      };
+      expect(where.projectId_groupId_hour.hour.toISOString()).toBe(
+        '2026-01-01T13:00:00.000Z',
+      );
+    });
+
+    it('新用户 → userCount 也 increment；create 分支带上同一个数', async () => {
+      const prisma = fakePrisma({
+        claimed: { ...CLAIMED, user_id: 'u_alice' },
+        affectedInserted: 1,
+      });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      const [stat] = prisma.statUpserts;
+      expect(stat.update).toMatchObject({ userCount: { increment: 1 } });
+      expect(stat.create).toMatchObject({ userCount: 1 });
+    });
+
+    it('老用户（去重命中）→ update 里根本不出现 userCount 字段', async () => {
+      const prisma = fakePrisma({
+        claimed: { ...CLAIMED, user_id: 'u_alice' },
+        affectedInserted: 0,
+      });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      const [stat] = prisma.statUpserts;
+      // 字段不出现 = 不写这一列；写成 { increment: 0 } 会产生一次无意义的写
+      expect('userCount' in stat.update).toBe(false);
+      expect(stat.update).toMatchObject({ eventCount: { increment: 1 } });
+      expect(stat.create).toMatchObject({ userCount: 0 });
+    });
+
+    it('没带 user_id 的事件照样记小时聚合（只是 userCount 不动）', async () => {
+      const prisma = fakePrisma({ claimed: { ...CLAIMED, user_id: null } });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      expect(prisma.statUpserts).toHaveLength(1);
+      expect('userCount' in prisma.statUpserts[0].update).toBe(false);
+    });
+
+    it('聚合 upsert 发生在事务里、且在声明之后（回滚能一起撤销）', async () => {
+      const prisma = fakePrisma({ claimed: CLAIMED });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      const claimAt = prisma.calls.indexOf('tx:claim');
+      const statAt = prisma.calls.indexOf('tx:upsertStat');
+      expect(claimAt).toBeGreaterThanOrEqual(0);
+      expect(statAt).toBeGreaterThan(claimAt);
     });
   });
 

@@ -16,6 +16,8 @@
     "dev:worker": "node --watch dist/src/worker.js",
     "seed": "npm run build && node --env-file=.env scripts/seed.cjs",
     "project:new": "npm run build && node --env-file=.env scripts/project-new.cjs",
+    "stats:backfill": "npm run build && node --env-file=.env scripts/stats-backfill.cjs",
+    "stats:reconcile": "npm run build && node --env-file=.env scripts/stats-reconcile.cjs",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/src/main",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",

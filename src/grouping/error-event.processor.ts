@@ -20,6 +20,7 @@ import {
   GROUPING_VERSION_SYMBOLICATED,
   parseFrames,
 } from './fingerprint';
+import { toHourBucket } from './issue-stats';
 import { SourcemapLookupService } from './sourcemap-lookup.service';
 import {
   buildSymbolicatedCulprit,
@@ -270,6 +271,8 @@ export class ErrorEventProcessor {
       // （RETURNING 漏写、或测试替身没造这个字段）会是 undefined ——
       // 只判 null 的话会走进分支，然后对着不存在的 affectedUser 取属性抛 TypeError，
       // 那是一个和业务毫无关系的报错。
+      // 这一小时"新增"了几个受影响用户 —— 给下面的小时聚合用
+      let newUsers = 0;
       if (claimed.user_id !== null && claimed.user_id !== undefined) {
         const inserted = await tx.affectedUser.createMany({
           data: [
@@ -284,14 +287,52 @@ export class ErrorEventProcessor {
           skipDuplicates: true,
         });
 
-        if (inserted.count > 0) {
+        newUsers = inserted.count;
+        if (newUsers > 0) {
           // 只有"新面孔"才 +1。increment 是原子的，不能写成 usersSeen + 1
           await tx.errorGroup.update({
             where: { id: group.id },
-            data: { usersSeen: { increment: inserted.count } },
+            data: { usersSeen: { increment: newUsers } },
           });
         }
       }
+
+      // ── 小时聚合（M5 / B2）─────────────────────────────────────────
+      // **必须和 times_seen 在同一个事务里**：这两处是"同一次发生"的两笔账。
+      // 分开写的话，归并后面报错回滚时 times_seen 撤销了、聚合却已经落库，
+      // 对账会立刻发现 sum(event_count) ≠ 明细条数 —— 而且聚合表只增不减，
+      // 这种漂移一旦产生就只能靠回填重建。
+      //
+      // 桶用**事件发生时间**（claimed.timestamp）截到 UTC 整点，不是 processed_at：
+      //   ① 看板按事件时间排序，趋势图必须与列表同源
+      //   ② 回填脚本只能从明细重建，明细里有 timestamp，没有"当时"的 processed_at
+      //   ③ 乱序补报的旧事件应当回到它自己那一小时，而不是补报的那一刻
+      const hour = toHourBucket(claimed.timestamp);
+
+      await tx.issueStatHourly.upsert({
+        where: {
+          // 复合主键的输入名 = 字段名用 _ 连接
+          projectId_groupId_hour: {
+            projectId: claimed.project_id,
+            groupId: group.id,
+            hour,
+          },
+        },
+        create: {
+          projectId: claimed.project_id,
+          groupId: group.id,
+          hour,
+          eventCount: 1,
+          // 首次出现的那条事件本身可能就带来一个新用户
+          userCount: newUsers,
+        },
+        update: {
+          // increment 而不是读改写：两个并发 Worker 落到同一小时会互相覆盖
+          eventCount: { increment: 1 },
+          // 没有新面孔时字段整个不出现，省掉一次无意义的写
+          ...(newUsers > 0 ? { userCount: { increment: newUsers } } : {}),
+        },
+      });
 
       await tx.errorEvent.update({
         where: { eventId },
