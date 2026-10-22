@@ -154,6 +154,9 @@ export class ErrorEventsService {
       timestamp: payload.timestamp ? new Date(payload.timestamp) : new Date(),
       url: payload.url ?? '',
       userAgent: payload.user_agent ?? '',
+      // 用户维度（M5）：SDK 三档降级的最终结果 —— 账号 ID / 匿名设备 ID / null。
+      // 这一列早就存在（error_events.user_id），只是以前没有上行链路，恒为 NULL。
+      userId: payload.user?.id ?? null,
       sdkName: payload.sdk?.name ?? null,
       sdkVersion: payload.sdk?.version ?? null,
       // 版本与环境：M3 的 Sourcemap 按 release 找 map（FR-3.4）。

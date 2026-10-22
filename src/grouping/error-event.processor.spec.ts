@@ -46,6 +46,8 @@ interface ClaimedEvent {
   release: string | null;
   /** S0：多租户归属。upsert 的唯一键是三元组，少了它就会退化成全局归并 */
   project_id: string;
+  /** M5：触发事件的用户（账号 ID 或匿名设备 ID）。null = 这条事件没带身份 */
+  user_id: string | null;
 }
 
 const TEST_PROJECT = '11111111-1111-1111-1111-111111111111';
@@ -61,6 +63,8 @@ const CLAIMED: ClaimedEvent = {
   timestamp: new Date('2026-01-01T00:00:00Z'),
   release: null,
   project_id: TEST_PROJECT,
+  // 默认不带身份：绝大多数既有断言描述的是"没有用户维度"的路径
+  user_id: null,
 };
 
 /** 假 Prisma：$transaction 直接把 tx 交给回调，$queryRaw 返回预置的声明结果 */
@@ -69,6 +73,11 @@ function fakePrisma(behavior: {
   existing?: { processedAt: Date | null } | null;
   /** upsert 后返回的 status，用来驱动 FR-4.8 的回归分支。默认 unresolved */
   groupStatus?: 'unresolved' | 'resolved' | 'ignored' | 'archived';
+  /**
+   * affectedUser.createMany 返回的 count。
+   * 默认 1（模拟"这是一张新面孔"）；传 0 模拟"去重表已存在该用户"
+   */
+  affectedInserted?: number;
 }) {
   const rows = behavior.claimed ? [behavior.claimed] : [];
   const calls: string[] = [];
@@ -76,6 +85,14 @@ function fakePrisma(behavior: {
     null;
   let updateArgs: { data: Record<string, unknown> } | null = null;
   let groupUpdateArgs: { data: Record<string, unknown> } | null = null;
+  /** M5：affectedUser.createMany 的入参（去重表写入） */
+  let affectedArgs: { data: Array<Record<string, unknown>> } | null = null;
+  /**
+   * errorGroup.update 的**全部**入参（按顺序）。
+   * 和 groupUpdateArgs（只有最后一次）的区别：M5 之后 update 有两个调用方 ——
+   * FR-4.8 的状态回归、以及 users_seen 的原子自增，需要能分别断言。
+   */
+  const groupUpdates: Array<{ data: Record<string, unknown> }> = [];
 
   return {
     calls,
@@ -90,6 +107,14 @@ function fakePrisma(behavior: {
     /** 状态回归时 errorGroup.update 的入参（只有 resolved 才有） */
     get groupUpdateArgs() {
       return groupUpdateArgs;
+    },
+    /** errorGroup.update 的全部入参，用来区分"状态回归"和"users_seen 自增" */
+    get groupUpdates() {
+      return groupUpdates;
+    },
+    /** 去重表写入的入参 */
+    get affectedArgs() {
+      return affectedArgs;
     },
     $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
       calls.push('tx:begin');
@@ -114,10 +139,21 @@ function fakePrisma(behavior: {
             };
           },
           // FR-4.8：只有 status 已经是 resolved 时才会走这一步
+          // M5：users_seen 的原子自增也走这里，所以两个调用方都要记下来
           update: async (args: unknown) => {
             calls.push('tx:regressGroup');
             groupUpdateArgs = args as { data: Record<string, unknown> };
+            groupUpdates.push(groupUpdateArgs);
             return {};
+          },
+        },
+        // M5 用户维度：影响用户去重表。
+        // 真实实现是 INSERT ... ON CONFLICT DO NOTHING，返回的 count 是"真的插了几行"
+        affectedUser: {
+          createMany: async (args: unknown) => {
+            calls.push('tx:affectedUser');
+            affectedArgs = args as { data: Array<Record<string, unknown>> };
+            return { count: behavior.affectedInserted ?? 1 };
           },
         },
         errorEvent: {
@@ -434,6 +470,63 @@ describe('ErrorEventProcessor', () => {
       await build(prisma, fakeDlq()).handle(jobLike({}));
 
       expect(prisma.calls[0]).toBe('tx:begin');
+    });
+  });
+
+  describe('用户维度（M5 / FR-4.4）', () => {
+    it('事件带 user_id → 写去重表，并把 users_seen +1', async () => {
+      const prisma = fakePrisma({ claimed: { ...CLAIMED, user_id: 'u_alice' } });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      expect(prisma.calls).toContain('tx:affectedUser');
+      expect(prisma.affectedArgs?.data[0]).toMatchObject({
+        projectId: TEST_PROJECT,
+        groupId: 'group-1',
+        userKey: 'u_alice',
+        // 测试数据没带 release，所以这里应该是 null（不是空串）
+        firstRelease: null,
+      });
+      // 必须用原子 increment：读改写会在并发下互相覆盖
+      const increment = prisma.groupUpdates.find((u) => 'usersSeen' in u.data);
+      expect(increment?.data).toMatchObject({ usersSeen: { increment: 1 } });
+    });
+
+    it('事件没带 user_id → 完全不碰去重表（users_seen 保持 0）', async () => {
+      const prisma = fakePrisma({ claimed: { ...CLAIMED, user_id: null } });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      expect(prisma.calls).not.toContain('tx:affectedUser');
+      expect(prisma.groupUpdates.some((u) => 'usersSeen' in u.data)).toBe(false);
+    });
+
+    it('去重表命中（count=0）→ 不重复累加 users_seen', async () => {
+      const prisma = fakePrisma({
+        claimed: { ...CLAIMED, user_id: 'u_alice' },
+        affectedInserted: 0,
+      });
+
+      await expect(
+        build(prisma, fakeDlq()).handle(jobLike({})),
+      ).resolves.toBeUndefined();
+
+      // 写了但没插进去 = 这个用户以前来过，不算新面孔
+      expect(prisma.calls).toContain('tx:affectedUser');
+      expect(prisma.groupUpdates.some((u) => 'usersSeen' in u.data)).toBe(false);
+    });
+
+    it('带上 release 时记进 firstRelease（版本维度可追溯）', async () => {
+      const prisma = fakePrisma({
+        claimed: { ...CLAIMED, user_id: 'u_bob', release: 'web@1.2.0' },
+      });
+
+      await build(prisma, fakeDlq()).handle(jobLike({}));
+
+      expect(prisma.affectedArgs?.data[0]).toMatchObject({
+        userKey: 'u_bob',
+        firstRelease: 'web@1.2.0',
+      });
     });
   });
 

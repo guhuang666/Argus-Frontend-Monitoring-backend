@@ -53,6 +53,13 @@ interface ClaimedEvent {
    * 全局归并 —— 两个项目的同名错误会被并成一个问题。
    */
   project_id: string;
+  /**
+   * 触发这条事件的用户（M5 / FR-4.4）：账号 ID 或匿名设备 ID，SDK 拿不到身份时 NULL。
+   *
+   * **同样必须跟着 RETURNING 回来**：它只用于写 affected_users 去重表。
+   * 漏掉这一列不会报任何错 —— 表现是 users_seen 永远停在 0，只能从看板上发现。
+   */
+  user_id: string | null;
 }
 
 /** claim() 的产出：声明到的事件 + 归并结果（给日志用） */
@@ -150,7 +157,7 @@ export class ErrorEventProcessor {
            SET processed_at = now()
          WHERE event_id = ${eventId}
            AND processed_at IS NULL
-        RETURNING event_id, mechanism, "type", message, stack, timestamp, release, project_id
+        RETURNING event_id, mechanism, "type", message, stack, timestamp, release, project_id, user_id
       `;
 
       const claimed = rows[0];
@@ -250,6 +257,40 @@ export class ErrorEventProcessor {
         this.logger.log(
           `问题回归: id=${group.id} resolved → unresolved（收到新事件）`,
         );
+      }
+
+      // ── 影响用户去重（M5 / FR-4.4）─────────────────────────────────
+      // 语义：users_seen = "这个问题见过多少个人"，不是"发生多少次"。
+      // 同一个用户报 10 次 → times_seen = 10，users_seen 仍然只加 1。
+      //
+      // 为什么用 createMany + skipDuplicates 而不是"先查后插"：
+      // 两个 Worker 并发处理同一用户的事件时，先查后插会双双通过、两个都去 +1；
+      // ON CONFLICT DO NOTHING 把判重交给数据库，返回的 count 才是"真的新增了几行"。
+      // 同时判 null 和 undefined：类型上只有 string | null，但运行时"这一列没拿到"
+      // （RETURNING 漏写、或测试替身没造这个字段）会是 undefined ——
+      // 只判 null 的话会走进分支，然后对着不存在的 affectedUser 取属性抛 TypeError，
+      // 那是一个和业务毫无关系的报错。
+      if (claimed.user_id !== null && claimed.user_id !== undefined) {
+        const inserted = await tx.affectedUser.createMany({
+          data: [
+            {
+              projectId: claimed.project_id,
+              groupId: group.id,
+              userKey: claimed.user_id,
+              // 记下"这个用户从哪个版本开始受影响"。非主键字段，不参与去重
+              firstRelease: claimed.release,
+            },
+          ],
+          skipDuplicates: true,
+        });
+
+        if (inserted.count > 0) {
+          // 只有"新面孔"才 +1。increment 是原子的，不能写成 usersSeen + 1
+          await tx.errorGroup.update({
+            where: { id: group.id },
+            data: { usersSeen: { increment: inserted.count } },
+          });
+        }
       }
 
       await tx.errorEvent.update({

@@ -294,6 +294,9 @@ model ErrorGroup {
   /// 反向关系：归并到本问题下的事件明细
   events ErrorEvent[]
 
+  /// 反向关系：这个问题的受影响用户（去重表，M5）
+  affectedUsers AffectedUser[]
+
   /// 归并的落点：同一项目 + 同一分组版本 + 同一指纹，只能有一行
   @@unique([projectId, groupingVersion, fingerprint])
   /// 索引一律以 project_id 打头 —— TC-08 要求每次查询都带 projectId，
@@ -302,6 +305,42 @@ model ErrorGroup {
   @@index([projectId, status, lastSeen(sort: Desc)])
   @@index([projectId, groupingVersion, lastSeen(sort: Desc)])
   @@map("error_groups")
+}
+
+/// 影响用户去重表（M5 / FR-4.4）—— 一行 =「这个问题的这个用户」
+///
+/// ── 为什么不直接在 error_groups.users_seen 上 +1 ─────────────────────────
+/// 同一个用户触发 10 次：times_seen 应该是 10，users_seen 必须是 1。
+/// 没有这张表就无法判断"这个用户是不是第一次来"，只能盲目累加。
+///
+/// ── 为什么 release 不进主键 ──────────────────────────────────────────────
+/// 主键决定去重语义。把 release 放进去，同一用户跨版本会被算成两个人，
+/// users_seen 立刻失真。release 用非主键的 firstRelease 记录（见下），
+/// 要"每版本受影响用户数"时应该另建表或查明细，而不是破坏这张表的语义。
+model AffectedUser {
+  /// 所属项目（TC-08：所有查询都带 projectId，放在主键最左前缀）
+  projectId String @map("project_id") @db.Uuid
+
+  /// 所属问题
+  groupId String @map("group_id") @db.Uuid
+
+  /// 用户标识：账号 ID（如 u_1024），或匿名设备 ID（anon_xxx）
+  userKey String @map("user_key") @db.VarChar(100)
+
+  /// 首次影响时间（服务端时钟）
+  firstSeen DateTime @default(now()) @map("first_seen") @db.Timestamptz
+
+  /// 这个用户**第一次**在这个问题上出现时的版本。
+  /// 不进主键：主键负责去重，它只负责"从哪个版本开始受影响"这一个问题。
+  /// 可空 —— SDK 允许不带 release。
+  firstRelease String? @map("first_release") @db.VarChar(100)
+
+  /// 外键。Cascade：删问题连带删掉去重记录（否则删项目后会留下孤儿行）
+  group ErrorGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  /// 主键天然去重：同一个 (项目, 问题, 用户) 只可能有一行
+  @@id([projectId, groupId, userKey])
+  @@map("affected_users")
 }
 
 /// 异常事件明细 —— 字段与删掉的 Mongoose error_events schema 一一对应

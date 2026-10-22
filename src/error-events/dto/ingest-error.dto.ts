@@ -26,6 +26,22 @@ export class SdkInfoDto {
   version!: string;
 }
 
+/**
+ * 上报体里的用户标识。
+ *
+ * 只收 id —— 邮箱、手机号、姓名一律不进上报链路（PII 不该出现在监控系统里）。
+ * 长度上限 100 必须与 error_events.user_id 的列宽一致：超了会撞 P2000 → 400
+ * → **整条错误事件被丢掉**。为了一个用户 ID 丢掉一条错误是本末倒置。
+ *
+ * ⚠️ 这个值**不可信**：上报走公钥鉴权，而公钥本来就是公开的，任何人可以伪造。
+ * 所以它只能用于统计（影响用户数 / UV），绝不能用于鉴权或计费。
+ */
+export class UserDto {
+  @IsString()
+  @Length(1, 100)
+  id!: string;
+}
+
 export class IngestErrorDto {
   /** 事件唯一 ID，后端据此去重 */
   @IsString()
@@ -98,6 +114,17 @@ export class IngestErrorDto {
   @IsString()
   @MaxLength(50)
   environment?: string;
+
+  /**
+   * 用户标识（M5）。SDK 三档降级的产物：账号 ID / 匿名设备 ID / 缺失。
+   *
+   * 必须在这里声明：ValidationPipe 的 whitelist 会把未声明的字段**静默剥掉**
+   * ——不报错、数据凭空消失，比 400 更难查。
+   */
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => UserDto)
+  user?: UserDto;
 
   /**
    * 错误发生前的行为轨迹（面包屑）。
