@@ -117,6 +117,9 @@ export class PerformanceService {
       deviceViewport: device?.viewport ?? null,
       deviceDpr: device?.dpr ?? null,
       connection: payload.connection ?? null,
+      // 用户标识。列早就存在，缺的一直是上行链路（DTO 不收 → 这里恒为 NULL）。
+      // SDK 拿不到身份时是 null，按匿名处理：不影响指标，只是不参与用户维度统计。
+      userId: payload.user?.id ?? null,
     };
   }
 

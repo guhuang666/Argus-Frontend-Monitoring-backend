@@ -30,6 +30,26 @@ export class PerfSdkInfoDto {
 }
 
 /**
+ * 上报体里的用户标识。
+ *
+ * 只收 id —— 邮箱、手机号、姓名一律不进上报链路（PII 不该出现在监控系统里）。
+ * 长度上限 100 必须与 performance_metrics.user_id 的列宽一致：超了会撞 P2000 → 400
+ * → **整条性能事件被丢掉**。为了一个用户 ID 丢掉一条指标是本末倒置。
+ *
+ * 与错误通道的 UserDto 形状完全相同（SDK 两个通道共用同一个 resolveUser()），
+ * 但**刻意各留一份而不共享**：两个 DTO 是两条独立的公开契约，将来一条要加字段
+ * 时不该牵动另一条。
+ *
+ * ⚠️ 这个值**不可信**：上报走公钥鉴权，而公钥本来就是公开的，任何人可以伪造。
+ * 所以它只能用于统计（影响用户数 / UV），绝不能用于鉴权或计费。
+ */
+export class PerfUserDto {
+  @IsString()
+  @Length(1, 100)
+  id!: string;
+}
+
+/**
  * 指标值。
  *
  * ⚠️ 这里的 `@IsOptional()` 不是可有可无的装饰：SDK 在「没采到」时发的是 **null**，
@@ -178,4 +198,20 @@ export class IngestPerfDto {
   @IsString()
   @MaxLength(16)
   connection?: string | null;
+
+  /**
+   * 用户标识。SDK 的性能通道从 `resolveUser()` 取，与错误通道同源同形。
+   *
+   * ── 为什么现在才收 ────────────────────────────────────────────────────
+   * `performance_metrics.user_id` 这一列早就在（Mongoose 时代就有），但一直没有
+   * 上行链路，恒为 NULL —— 表现是「哪个用户的 LCP 最差」答不出来。
+   * SDK 侧的 PerfEvent 从 M3 起就已经带 `user: { id }` 了，缺的只是接收端。
+   *
+   * 可空：SDK 拿不到身份时发 null，按"匿名访问"处理 —— 匿名不影响指标本身，
+   * 只是不参与用户维度统计，所以不该因为缺身份就把整条指标拒掉。
+   */
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => PerfUserDto)
+  user?: PerfUserDto | null;
 }

@@ -37,7 +37,16 @@ export class KeysService {
   /**
    * 上报鉴权：公钥 → 项目信息（id + 限流配置）。
    *
-   * 查不到、已吊销、或压根没带 → 401（FR-5.7：不确定的情况一律拒绝）。
+   * 四种情况一律 401（FR-5.7：不确定的情况一律拒绝）：
+   *   ① 压根没带钥匙  ② 钥匙不存在  ③ 钥匙已吊销（超过宽限期）  ④ **项目已停用**
+   *
+   * ④ 是 S0 之后补的一道闸：过去只校验钥匙，`projects.is_active` 形同虚设 ——
+   * 停用一个项目后 SDK 照样能上报，库里继续增长事件，但这些事件在归并阶段
+   * 找不到有效项目，最终堆出 `group_id IS NULL` 的僵尸行。停用必须在入口生效。
+   *
+   * 缓存带来的延迟：已缓存的项目被停用后，最多 `CACHE_TTL_MS`（30 秒）内仍放行。
+   * 与"吊销钥匙"的延迟一致 —— 停用不是紧急操作，30 秒可以接受。
+   * 反过来的方向是安全的：**停用的项目永远不会被写进缓存**（走到缓存之前就抛了）。
    *
    * ── 为什么把 rateLimitPerSec 也带出来 ──────────────────────────────────
    * S6 的限流必须知道"这个项目的上限是多少"，而这个值就存在 projects 表上。
@@ -70,13 +79,24 @@ export class KeysService {
       },
       select: {
         projectId: true,
-        project: { select: { rateLimitPerSec: true } },
+        // isActive 必须一起查：只判"钥匙有效"不够 —— 钥匙还在、但项目被停用时
+        // 仍然会放行，结果是一条能写库、却在归并阶段找不到归属的事件
+        // （error_groups.project_id 是必填，Worker 会把它挤成 group_id = NULL 的僵尸行）。
+        // 停用是管理动作，必须在入口就挡住，不能等归并阶段才发现。
+        project: { select: { rateLimitPerSec: true, isActive: true } },
       },
     });
 
     if (row === null) {
       // 不在报错信息里区分"不存在"和"已吊销"：两者对外都是 401，避免探测
       throw new UnauthorizedException('上报密钥无效或已吊销');
+    }
+
+    if (!row.project.isActive) {
+      // 与"钥匙无效"用同一条对外措辞，但日志里要能分辨：
+      // 停用是有人主动做的，排查时最想知道的就是这一条
+      this.logger.warn(`项目已停用，拒绝上报: projectId=${row.projectId} key=${key.slice(0, 16)}…`);
+      throw new UnauthorizedException('项目已停用，拒绝上报');
     }
 
     const resolved = {
