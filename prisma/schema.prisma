@@ -291,6 +291,21 @@ model ErrorGroup {
   /// 最近出现时的 release 版本。可空，理由同上
   lastRelease String? @map("last_release") @db.VarChar(100)
 
+  /// 最近一次出现在哪个环境（M5 / FR-8.3）：production / staging / local…
+  ///
+  /// ── 为什么要在问题上冗余这一列 ──────────────────────────────────────────
+  /// environment 只存在于 `error_events`（明细）。问题列表要按环境筛，
+  /// 于是只有两条路：查询时 `EXISTS (SELECT 1 FROM error_events ...)`
+  /// 或者在这里存一份。前者有两个坑：
+  ///   ① 每行一次子查询，列表一慢就慢在这里；
+  ///   ② 明细只保留 30 天，第 31 天起**筛出来的结果会自己变少** ——
+  ///      用户没改任何条件，列表却空了，这是最难解释的一类 bug。
+  ///
+  /// 语义是「**最近一次**出现在哪个环境」，不是「出现在过哪些环境」。
+  /// 同一份代码通常只部署在一个环境，这个近似在实践中够用；
+  /// 真要"多环境集合"得另建一张 (group, environment) 的表。
+  lastEnvironment String? @map("last_environment") @db.VarChar(50)
+
   /// 解决时间，NULL 表示尚未解决。只在进入 resolved 时打点、离开时清空
   resolvedAt DateTime? @map("resolved_at") @db.Timestamptz
 
@@ -310,6 +325,11 @@ model ErrorGroup {
   @@index([projectId, lastSeen(sort: Desc)])
   @@index([projectId, status, lastSeen(sort: Desc)])
   @@index([projectId, groupingVersion, lastSeen(sort: Desc)])
+  /// 按次数 / 按影响用户数排序（FR-8.3）。
+  /// 没有这两条索引时，把排序字段从「最近出现」换成「次数」，
+  /// 会让整个项目的问题行做一次全量 sort —— 数据一多就从这个功能开始慢。
+  @@index([projectId, timesSeen(sort: Desc)])
+  @@index([projectId, usersSeen(sort: Desc)])
   @@map("error_groups")
 }
 

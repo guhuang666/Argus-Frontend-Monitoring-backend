@@ -1,4 +1,4 @@
-﻿import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ProjectScopeGuard } from '../auth/project-scope.guard';
 import { PageQueryDto } from '../common/dto/page-query.dto';
@@ -34,13 +34,30 @@ export class IssuesController {
   constructor(private readonly service: IssuesService) {}
 
   /**
-   * GET /api/v1/issues?projectId=&page=&pageSize=&status=
-   * 问题列表，按最近出现时间倒序。status 可选，不传 = 全部状态。
+   * GET /api/v1/issues?projectId=&page=&pageSize=&status=&level=&q=&release=
+   *     &environment=&from=&to=&sort=&order=
+   * 问题列表：六维筛选 + 排序 + 分页（FR-8.3）。
+   *
+   * 所有筛选参数都可选，都不传时行为与改动前逐字节相同（lastSeen 倒序）。
    */
   @Get()
   @UseGuards(JwtAuthGuard, ProjectScopeGuard)
   list(@Query() query: ListIssuesQueryDto) {
     return this.service.listIssues(query);
+  }
+
+  /**
+   * GET /api/v1/issues/facets?projectId=
+   * 筛选栏的下拉数据：这个项目出现过哪些环境 / 版本。
+   *
+   * ⚠️ **必须声明在 `@Get(':id')` 之前**。Nest 的路由按声明顺序匹配，
+   * `facets` 放在后面会被 `:id` 吃掉 → ParseUUIDPipe 直接回 400，
+   * 报错信息是"uuid 格式不对"，而真正的原因只是顺序写反了。
+   */
+  @Get('facets')
+  @UseGuards(JwtAuthGuard, ProjectScopeGuard)
+  facets(@Query() tenant: TenantQueryDto) {
+    return this.service.facets(tenant.projectId);
   }
 
   /**

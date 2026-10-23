@@ -55,6 +55,13 @@ interface ClaimedEvent {
    */
   project_id: string;
   /**
+   * 运行环境（M5 / FR-8.3）：production / staging / local。可空 —— SDK 允许不配。
+   *
+   * **必须跟着 RETURNING 回来**：它要写进 `error_groups.last_environment`，
+   * 也就是问题列表按环境筛选的唯一依据。漏掉不会报错，只会让筛选永远命中不到。
+   */
+  environment: string | null;
+  /**
    * 触发这条事件的用户（M5 / FR-4.4）：账号 ID 或匿名设备 ID，SDK 拿不到身份时 NULL。
    *
    * **同样必须跟着 RETURNING 回来**：它只用于写 affected_users 去重表。
@@ -158,7 +165,7 @@ export class ErrorEventProcessor {
            SET processed_at = now()
          WHERE event_id = ${eventId}
            AND processed_at IS NULL
-        RETURNING event_id, mechanism, "type", message, stack, timestamp, release, project_id, user_id
+        RETURNING event_id, mechanism, "type", message, stack, timestamp, release, project_id, user_id, environment
       `;
 
       const claimed = rows[0];
@@ -230,6 +237,8 @@ export class ErrorEventProcessor {
           // 版本与 firstSeen 同一个套路：首次出现时一次写定，之后不动
           firstRelease: claimed.release,
           lastRelease: claimed.release,
+          // 环境不是"首次写定"而是"跟随最近一次"（见 update 分支）
+          lastEnvironment: claimed.environment,
         },
         update: {
           // firstSeen / firstRelease 有意不更新 —— 见类注释
@@ -238,6 +247,11 @@ export class ErrorEventProcessor {
           // 未配置版本的页面会和带版本的事件归到同一个问题里，
           // 直接写 lastRelease: null 会把好不容易记下的版本抹掉
           ...(claimed.release !== null ? { lastRelease: claimed.release } : {}),
+          // 同理：没配 environment 的上报不能把已知环境抹成 NULL，
+          // 否则一条"忘了配"的事件就能让这个问题从环境筛选里消失
+          ...(claimed.environment !== null
+            ? { lastEnvironment: claimed.environment }
+            : {}),
           // 必须用原子 increment，不能写成 timesSeen + 1：
           // 两个并发 Worker 各自读改写会互相覆盖，实际发生 2 次却只加 1
           timesSeen: { increment: 1 },
