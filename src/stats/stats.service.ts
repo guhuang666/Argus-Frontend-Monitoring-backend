@@ -1,7 +1,12 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { Prisma } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { RANGE_MS, type OverviewRange } from './dto/overview-query.dto';
+import {
+  RANGE_MS,
+  TOP_LIMIT_DEFAULT,
+  TOP_LIMIT_MAX,
+  type OverviewRange,
+} from './dto/overview-query.dto';
 import { PERF_METRICS, type PerfMetric } from './dto/performance-query.dto';
 
 /**
@@ -19,13 +24,22 @@ import { PERF_METRICS, type PerfMetric } from './dto/performance-query.dto';
  * 唯一读 `error_groups` 的是"新问题数"，它没有对应的聚合表，
  * 且过滤条件是 `first_seen` 的时间范围，走 (project_id, first_seen) 能定位。
  *
- * ── 本批刻意不做的事 ───────────────────────────────────────────────────
- *   · Top N 排行：要在窗口内 `SUM(event_count) GROUP BY group_id` 再回表取标题，
- *     属于下一个批次；注意**不能用 error_groups.times_seen**，那是累计值，
- *     拿来排序得到的是"历史总榜"而不是"近 24 小时榜"
- *   · 影响用户数：`issue_stats_hourly.user_count` 是"每小时 × 每组"的首次影响计数，
- *     跨小时、跨组直接求和都会重复计同一个人；精确去重要查 affected_users，
- *     同样留到下一批
+ * ── Top N 的两个榜（FR-8.2）与它们的口径 ───────────────────────────────
+ * 榜单**只在窗口内求和**，绝不用 `error_groups.times_seen` —— 那是终身累计值，
+ * 拿它排序得到的是"历史总榜"，跟用户选的时间范围完全无关。这是本模块最容易
+ * 犯的错，而且错得很隐蔽：榜单看上去永远有数据，只是永远不变。
+ *
+ * · byEvents = Σ issue_stats_hourly.event_count → "这段时间谁最吵"
+ * · byUsers  = Σ issue_stats_hourly.user_count  → **"这段时间新增受影响用户"**
+ *
+ * user_count 的判据是 `affected_users.first_seen` 落在哪个小时桶，一个人只会在
+ * "首次被影响"的那个桶里计一次。所以窗口外首次、窗口内仍在报错的用户**不计入**。
+ * 这是刻意的近似（精确口径需要一张按天去重的表），因此界面文案必须写
+ * 「新增受影响用户」而不是「受影响用户」。
+ *
+ * 两个指标还用了不同的时钟：event_count 按事件时间（客户端时钟 timestamp），
+ * user_count 按首次影响时间（服务端时钟）。所以两条曲线不能逐桶相加，
+ * 但各自的窗口总量都能与明细对账。
  */
 @Injectable()
 export class StatsService {
@@ -39,12 +53,18 @@ export class StatsService {
    * 两个端点都由服务端时钟决定（不用客户端传的时间），避免各端时钟漂移
    * 导致的"同一时刻两个人看到不同总数"。
    */
-  async overview(projectId: string, range: OverviewRange) {
+  async overview(
+    projectId: string,
+    range: OverviewRange,
+    topLimit: number = TOP_LIMIT_DEFAULT,
+  ) {
     const { bucket, from, to } = this.window(range);
+    const limit = clampTopLimit(topLimit);
 
-    // 三条查询放进同一个事务：同一快照下读，避免"总量比趋势之和还小"
-    // 这种自相矛盾的页面上限（并发写入时确实会发生）
-    const [summaryRows, newIssueRows, trendRows] =
+    // 五条查询放进同一个事务：同一快照下读，避免"总量比趋势之和还小"
+    // 这种自相矛盾的页面上限（并发写入时确实会发生）；两个榜单也必须与
+    // summary 同源，否则会出现"榜上第一名 180 次，而总数只有 150 次"。
+    const [summaryRows, newIssueRows, trendRows, topByEventRows, topByUserRows] =
       await this.prisma.$transaction([
         this.prisma.$queryRaw<SummaryRow[]>`
         SELECT COALESCE(SUM(event_count), 0) AS events,
@@ -71,6 +91,8 @@ export class StatsService {
          GROUP BY 1
          ORDER BY 1
       `,
+        this.topIssues(projectId, from, to, limit, 'events'),
+        this.topIssues(projectId, from, to, limit, 'users'),
       ]);
 
     const summary = summaryRows[0];
@@ -90,6 +112,11 @@ export class StatsService {
         events: toNumber(summary?.events),
         issues: toNumber(summary?.issues),
         new_issues: toNumber(newIssueRows[0]?.n),
+      },
+      top: {
+        limit,
+        byEvents: topByEventRows.map(toTopIssue),
+        byUsers: topByUserRows.map(toTopIssue),
       },
       trend: points,
     };
@@ -249,6 +276,47 @@ export class StatsService {
    * 定义：事件数缺桶 = 0（真的没发生），分位数缺桶 = null（没有样本，不等于 0）。
    * 这正是这两个接口最容易写混的地方，所以刻意让它必须在调用点显式写出来。
    */
+  /**
+   * 窗口内的 Top N 榜（FR-8.2）。
+   *
+   * ── 为什么和 summary 在同一个事务里算，而不是单独开一个接口 ──────────────
+   * 概览页要一次渲染完。拆成两个请求会让卡片和曲线分批出现（瀑布），
+   * 更要紧的是两次请求读到两个快照 —— 会出现"榜上第一名 180 次，
+   * 而页面顶部的总数写着 150 次"这种自相矛盾的画面。
+   *
+   * ── 为什么排序字段要过 Prisma.raw 白名单 ────────────────────────────────
+   * SQL 的标识符不能参数化（`$1` 只能绑值）。这里的排序字段被参数类型限死为
+   * `'events' | 'users'`，拼进语句前再做一次映射，保证**请求里的字符串
+   * 永远没有机会进 ORDER BY**（与 performanceTrend 的 metric 白名单同一套思路）。
+   */
+  private topIssues(
+    projectId: string,
+    from: Date,
+    to: Date,
+    limit: number,
+    orderBy: 'events' | 'users',
+  ) {
+    const column = Prisma.raw(orderBy === 'users' ? 'users' : 'events');
+
+    return this.prisma.$queryRaw<TopRow[]>`
+      SELECT g.id,
+             g.title,
+             g.culprit,
+             g."level" AS level,
+             g.status,
+             SUM(s.event_count)::bigint AS events,
+             SUM(s.user_count)::bigint  AS users
+        FROM issue_stats_hourly s
+        JOIN error_groups g ON g.id = s.group_id
+       WHERE s.project_id = ${projectId}::uuid
+         AND s.hour >= ${from}
+         AND s.hour <  ${to}
+       GROUP BY g.id, g.title, g.culprit, g."level", g.status
+       ORDER BY ${column} DESC, g.id
+       LIMIT ${limit}
+    `;
+  }
+
   private fillGaps<R extends { bucket: Date }, P>(
     rows: R[],
     from: Date,
@@ -305,6 +373,23 @@ interface TrendRow {
 }
 
 /**
+ * Top N 榜的原始行（`issue_stats_hourly` × `error_groups`）。
+ *
+ * events / users 同样可能是 bigint：`SUM()` 在 PG 里返回 bigint，
+ * 出口必须过 `toNumber()`，否则 `JSON.stringify` 直接抛
+ * "Do not know how to serialize a BigInt"。
+ */
+interface TopRow {
+  id: string;
+  title: string;
+  culprit: string | null;
+  level: string;
+  status: string;
+  events: bigint | number;
+  users: bigint | number;
+}
+
+/**
  * metric → SQL 列名。
  *
  * 目前三个 key 和列名同名（lcp/cls/inp），看着像多余的一层映射，
@@ -347,4 +432,36 @@ function toNumber(value: bigint | number | null | undefined): number {
  */
 function toNullableNumber(value: number | null | undefined): number | null {
   return value === null || value === undefined ? null : Number(value);
+}
+
+/**
+ * 榜单行 → 接口形状。
+ *
+ * 单独抽出来只为一件事：把 bigint 转换集中在一处。榜单里有两个 SUM，
+ * 漏掉任何一个都会在序列化时抛错，而抛错发生在响应阶段（控制器已经返回了
+ * 对象），排查时看到的是一句和榜单毫无关系的 "Do not know how to serialize a BigInt"。
+ */
+function toTopIssue(row: TopRow) {
+  return {
+    id: row.id,
+    title: row.title,
+    culprit: row.culprit,
+    level: row.level,
+    status: row.status,
+    events: toNumber(row.events),
+    users: toNumber(row.users),
+  };
+}
+
+/**
+ * 夹紧 Top N 的条数。
+ *
+ * DTO 的 `@Max(10)` 是第一道闸（给调用方一个干净的 400）；这里管的是
+ * "绕过 DTO 的入口"——脚本、将来的内部调用、以及有人把 controller 改成
+ * 直接读 `query.topLimit` 的那一天。`limit` 会进 SQL 的 `LIMIT`，
+ * 是唯一能让调用方放大查询量的维度，两道闸都留着。
+ */
+function clampTopLimit(value: number): number {
+  if (!Number.isFinite(value)) return TOP_LIMIT_DEFAULT;
+  return Math.min(Math.max(Math.trunc(value), 1), TOP_LIMIT_MAX);
 }

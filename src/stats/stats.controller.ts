@@ -29,7 +29,7 @@ export class StatsController {
   @Get('overview')
   @UseGuards(JwtAuthGuard, ProjectScopeGuard)
   overview(@Query() query: OverviewQueryDto) {
-    return this.service.overview(query.projectId, query.range);
+    return this.service.overview(query.projectId, query.range, query.topLimit);
   }
 
   /**

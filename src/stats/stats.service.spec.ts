@@ -283,4 +283,101 @@ describe('StatsService', () => {
       expect(result.trend[0].events).toBe(0);
     });
   });
+
+  describe('overview 的 Top N 榜（FR-8.2）', () => {
+    /** 一个榜单行；默认值是"按次数榜的第一名" */
+    function topRow(overrides: Partial<Record<string, unknown>> = {}) {
+      return {
+        id: 'g-1',
+        title: 'TypeError: alpha',
+        culprit: 'main.js:renderList',
+        level: 'error',
+        status: 'unresolved',
+        events: 180n,
+        users: 12n,
+        ...overrides,
+      };
+    }
+
+    /** 5 条查询的响应位：summary / newIssues / trend / byEvents / byUsers */
+    function responses(
+      top: { byEvents?: unknown[]; byUsers?: unknown[] } = {},
+    ) {
+      return [[], [], [], top.byEvents ?? [], top.byUsers ?? []];
+    }
+
+    it('榜单行原样映射，且 SUM 的 bigint 被转成 number', async () => {
+      const { service } = build([
+        [],
+        [],
+        [],
+        [topRow()],
+        [topRow({ id: 'g-2', events: 5n, users: 40n })],
+      ]);
+
+      const result = await service.overview(PROJECT, '24h');
+
+      expect(result.top.byEvents[0]).toEqual({
+        id: 'g-1',
+        title: 'TypeError: alpha',
+        culprit: 'main.js:renderList',
+        level: 'error',
+        status: 'unresolved',
+        events: 180,
+        users: 12,
+      });
+      // bigint 漏转 → JSON.stringify 直接抛 "Do not know how to serialize a BigInt"
+      expect(typeof result.top.byEvents[0].events).toBe('number');
+      expect(() => JSON.stringify(result)).not.toThrow();
+    });
+
+    it('两个榜各发一条 SQL，且 ORDER BY 字段不同', async () => {
+      const { service, calls } = build(responses());
+
+      await service.overview(PROJECT, '24h');
+
+      const rankSqls = calls
+        .map(renderSql)
+        .filter((sql) => sql.includes('issue_stats_hourly s'));
+      expect(rankSqls).toHaveLength(2);
+      expect(rankSqls.some((sql) => sql.includes('ORDER BY events DESC'))).toBe(
+        true,
+      );
+      expect(rankSqls.some((sql) => sql.includes('ORDER BY users DESC'))).toBe(
+        true,
+      );
+    });
+
+    it('榜单一律按窗口内求和，SQL 里绝不出现 times_seen（那是累计值）', async () => {
+      const { service, calls } = build(responses());
+
+      await service.overview(PROJECT, '24h');
+
+      for (const call of calls) {
+        expect(renderSql(call)).not.toContain('times_seen');
+      }
+    });
+
+    it('topLimit：默认 5、超上限夹到 10、非正数夹到 1', async () => {
+      const preset = build(responses());
+      expect((await preset.service.overview(PROJECT, '24h')).top.limit).toBe(5);
+
+      const over = build(responses());
+      expect(
+        (await over.service.overview(PROJECT, '24h', 999)).top.limit,
+      ).toBe(10);
+
+      const zero = build(responses());
+      expect((await zero.service.overview(PROJECT, '24h', 0)).top.limit).toBe(1);
+    });
+
+    it('空窗口 → 两个榜都是空数组，不抛错', async () => {
+      const { service } = build(responses());
+
+      const result = await service.overview(PROJECT, '24h');
+
+      expect(result.top.byEvents).toEqual([]);
+      expect(result.top.byUsers).toEqual([]);
+    });
+  });
 });

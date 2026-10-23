@@ -1,4 +1,5 @@
-import { IsIn } from 'class-validator';
+import { Type } from 'class-transformer';
+import { IsIn, IsInt, IsOptional, Max, Min } from 'class-validator';
 import { TenantQueryDto } from '../../common/dto/tenant-query.dto';
 
 /**
@@ -23,6 +24,17 @@ export const RANGE_MS: Record<OverviewRange, number> = {
 };
 
 /**
+ * Top N 榜单的默认条数与硬上限。
+ *
+ * 上限存在的理由：`topLimit` 是这个接口唯一一个"调用方能放大"的维度，
+ * 它会直接进 SQL 的 `LIMIT`。没有上限的话，一个 `?topLimit=100000`
+ * 就能让概览页把整个聚合表捞出来。
+ * 10 条已经填满任何一张榜单卡片，再多也显示不下。
+ */
+export const TOP_LIMIT_DEFAULT = 5;
+export const TOP_LIMIT_MAX = 10;
+
+/**
  * GET /api/v1/stats/overview 的查询参数。
  *
  * 继承 TenantQueryDto 而不是再写一遍 `@IsUUID() projectId`：
@@ -35,4 +47,18 @@ export class OverviewQueryDto extends TenantQueryDto {
   // 展开成数组再传给 @IsIn：它要的是可变数组，readonly 元组在类型上不兼容
   @IsIn([...OVERVIEW_RANGES])
   range: OverviewRange = '24h';
+
+  /**
+   * Top N 榜单要几条。默认 5，上限 10（FR-8.2）。
+   *
+   * 必须显式 `@Type(() => Number)`：全局 ValidationPipe 关掉了
+   * `enableImplicitConversion`，不做转换的话 query 里的 `"5"` 是字符串，
+   * `@IsInt` 会直接回 400 —— 而调用方看到的是一个"什么都没错"的 5。
+   */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(TOP_LIMIT_MAX)
+  topLimit: number = TOP_LIMIT_DEFAULT;
 }
