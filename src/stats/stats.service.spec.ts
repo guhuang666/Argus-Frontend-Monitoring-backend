@@ -284,6 +284,60 @@ describe('StatsService', () => {
     });
   });
 
+  describe('overview 的流量指标（PV / UV / 错误率）', () => {
+    /** 6 条查询的响应位：summary / newIssues / trend / byEvents / byUsers / traffic */
+    const withTraffic = (traffic: unknown[] = []) => [[], [], [], [], [], traffic];
+
+    it('映射 pv / uv / sessions / errored，并算出错误率', async () => {
+      const { service } = build(
+        withTraffic([{ pv: 1820n, uv: 96n, sessions: 48n, errored: 21n }]),
+      );
+
+      const result = await service.overview(PROJECT, '24h');
+
+      expect(result.traffic).toEqual({
+        pv: 1820,
+        uv: 96,
+        sessions: 48,
+        errored_sessions: 21,
+        // 21 / 48 = 0.4375 —— 界面上显示 43.8%
+        error_rate: 0.4375,
+      });
+      // bigint 漏转 → JSON.stringify 直接抛
+      expect(() => JSON.stringify(result)).not.toThrow();
+    });
+
+    it('没有会话时 error_rate 是 null，不是 0', async () => {
+      const { service } = build(
+        withTraffic([{ pv: 0n, uv: 0n, sessions: 0n, errored: 0n }]),
+      );
+
+      const result = await service.overview(PROJECT, '24h');
+
+      // "0% 错误率"读起来是"一切正常"；真相是"这段时间没有访问数据"
+      expect(result.traffic.error_rate).toBeNull();
+      expect(result.traffic.sessions).toBe(0);
+    });
+
+    it('流量 SQL 从 sessions 取数、按 started_at 过滤、projectId 只走参数绑定', async () => {
+      const { service, calls } = build(withTraffic());
+
+      await service.overview(PROJECT, '24h');
+
+      const trafficCall = calls[calls.length - 1];
+      const sql = renderSql(trafficCall);
+      expect(sql).toContain('FROM sessions');
+      expect(sql).toContain('SUM(page_views)');
+      // UV 用 DISTINCT，匿名会话（user_key 为 NULL）不计入
+      expect(sql).toContain('COUNT(DISTINCT user_key)');
+      expect(sql).toContain('FILTER (WHERE had_error)');
+      expect(sql).toContain('started_at >=');
+      // 拼进语句文本就是注入面
+      expect(trafficCall.text).not.toContain(PROJECT);
+      expect(trafficCall.values).toContain(PROJECT);
+    });
+  });
+
   describe('overview 的 Top N 榜（FR-8.2）', () => {
     /** 一个榜单行；默认值是"按次数榜的第一名" */
     function topRow(overrides: Partial<Record<string, unknown>> = {}) {

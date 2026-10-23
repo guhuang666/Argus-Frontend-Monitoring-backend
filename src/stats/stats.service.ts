@@ -61,12 +61,20 @@ export class StatsService {
     const { bucket, from, to } = this.window(range);
     const limit = clampTopLimit(topLimit);
 
-    // 五条查询放进同一个事务：同一快照下读，避免"总量比趋势之和还小"
+    // 六条查询放进同一个事务：同一快照下读，避免"总量比趋势之和还小"
     // 这种自相矛盾的页面上限（并发写入时确实会发生）；两个榜单也必须与
     // summary 同源，否则会出现"榜上第一名 180 次，而总数只有 150 次"。
-    const [summaryRows, newIssueRows, trendRows, topByEventRows, topByUserRows] =
-      await this.prisma.$transaction([
-        this.prisma.$queryRaw<SummaryRow[]>`
+    // traffic（PV/UV/错误率）同理：三个数必须来自同一批会话行，
+    // 否则可能出现"PV 有 100，会话说 0"。
+    const [
+      summaryRows,
+      newIssueRows,
+      trendRows,
+      topByEventRows,
+      topByUserRows,
+      trafficRows,
+    ] = await this.prisma.$transaction([
+      this.prisma.$queryRaw<SummaryRow[]>`
         SELECT COALESCE(SUM(event_count), 0) AS events,
                COUNT(DISTINCT group_id)      AS issues
           FROM issue_stats_hourly
@@ -74,14 +82,14 @@ export class StatsService {
            AND hour >= ${from}
            AND hour <  ${to}
       `,
-        this.prisma.$queryRaw<NewIssueRow[]>`
+      this.prisma.$queryRaw<NewIssueRow[]>`
         SELECT COUNT(*) AS n
           FROM error_groups
          WHERE project_id = ${projectId}::uuid
            AND first_seen >= ${from}
            AND first_seen <  ${to}
       `,
-        this.prisma.$queryRaw<TrendRow[]>`
+      this.prisma.$queryRaw<TrendRow[]>`
         SELECT date_bin(${bucket.interval}::interval, hour, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS bucket,
                SUM(event_count) AS events
           FROM issue_stats_hourly
@@ -91,9 +99,19 @@ export class StatsService {
          GROUP BY 1
          ORDER BY 1
       `,
-        this.topIssues(projectId, from, to, limit, 'events'),
-        this.topIssues(projectId, from, to, limit, 'users'),
-      ]);
+      this.topIssues(projectId, from, to, limit, 'events'),
+      this.topIssues(projectId, from, to, limit, 'users'),
+      this.prisma.$queryRaw<TrafficRow[]>`
+        SELECT COALESCE(SUM(page_views), 0)          AS pv,
+               COUNT(DISTINCT user_key)              AS uv,
+               COUNT(*)                              AS sessions,
+               COUNT(*) FILTER (WHERE had_error)     AS errored
+          FROM sessions
+         WHERE project_id = ${projectId}::uuid
+           AND started_at >= ${from}
+           AND started_at <  ${to}
+      `,
+    ]);
 
     const summary = summaryRows[0];
     const points = this.fillGaps(trendRows, from, to, bucket.ms, (t, row) => ({
@@ -113,6 +131,7 @@ export class StatsService {
         issues: toNumber(summary?.issues),
         new_issues: toNumber(newIssueRows[0]?.n),
       },
+      traffic: toTraffic(trafficRows[0]),
       top: {
         limit,
         byEvents: topByEventRows.map(toTopIssue),
@@ -450,6 +469,45 @@ function toTopIssue(row: TopRow) {
     status: row.status,
     events: toNumber(row.events),
     users: toNumber(row.users),
+  };
+}
+
+/**
+ * 流量（PV / UV / 错误率）的原始行，来自 `sessions` 表。
+ *
+ * `COUNT(DISTINCT user_key)` 只数非 NULL —— 匿名会话（SDK 拿不到身份）
+ * **不进 UV**。这是对的：UV 的口径是"能识别出来的人"，
+ * 把匿名会话算进去会让同一个浏览器清缓存/换无痕后被反复计数。
+ */
+interface TrafficRow {
+  pv: bigint | number;
+  uv: bigint | number;
+  sessions: bigint | number;
+  errored: bigint | number;
+}
+
+/**
+ * 流量行 → 接口形状。
+ *
+ * ── `error_rate` 在没有会话时返回 null，而不是 0 ────────────────────────
+ * "0% 错误率"读起来是"一切正常"，而真相是"这段时间根本没有访问数据"。
+ * 前端把 null 渲染成 "—"，两者绝不能混 —— 这与性能页对 lcp/inp 的
+ * null 处理是同一条纪律（没测到 ≠ 测得 0）。
+ *
+ * ── 同时返回分子分母 ────────────────────────────────────────────────────
+ * `sessions` / `errored_sessions` 一起给出，界面上才能写清"21 / 48"，
+ * 数字对不上时也能立刻看出是分子还是分母的问题。
+ */
+function toTraffic(row: TrafficRow | undefined) {
+  const sessions = toNumber(row?.sessions);
+  const errored = toNumber(row?.errored);
+  return {
+    pv: toNumber(row?.pv),
+    uv: toNumber(row?.uv),
+    sessions,
+    errored_sessions: errored,
+    // 保留 4 位小数：0.4375 → 界面上显示 43.8%
+    error_rate: sessions === 0 ? null : Math.round((errored / sessions) * 10000) / 10000,
   };
 }
 
