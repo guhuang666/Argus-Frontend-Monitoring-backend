@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { QueueModule } from '../queue/queue.module';
+import { SessionsModule } from '../sessions/sessions.module';
 import { ErrorEventsController } from './error-events.controller';
 import { ErrorEventsService } from './error-events.service';
 
@@ -12,9 +13,12 @@ import { ErrorEventsService } from './error-events.service';
  * W3 起 imports QueueModule：ingest 写库成功后要往归并队列投一条 job。
  * 注意这里只用到"投递"能力（Queue），消费在 worker.ts 那套进程里
  * —— 见 grouping.module.ts 的警告。
+ *
+ * M5 起 imports SessionsModule：入库成功后顺手 upsert 会话行
+ * （错误率的分子靠它）。会话写失败不影响事件入库，见 SessionsService 的注释。
  */
 @Module({
-  imports: [QueueModule],
+  imports: [QueueModule, SessionsModule],
   controllers: [ErrorEventsController],
   providers: [ErrorEventsService],
   exports: [ErrorEventsService],

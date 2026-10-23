@@ -155,6 +155,9 @@ model Project {
   /// 一个项目可以有多把钥匙（轮换 / 多环境）。见 ProjectKey 的注释
   keys               ProjectKey[]
 
+  /// 反向关系：本项目的页面会话（M5）。PV/UV/错误率的口径基础
+  sessions           Session[]
+
   /// 同组织内项目名不允许重复（MVP-B）。
   /// 在数据库层拦而不是应用层"先查后插"：并发创建两个同名项目时，
   /// 应用层的检查会同时通过，最后切换器里出现两个一模一样的条目 —— 人分不清。
@@ -367,6 +370,59 @@ model AffectedUser {
   /// 主键天然去重：同一个 (项目, 问题, 用户) 只可能有一行
   @@id([projectId, groupId, userKey])
   @@map("affected_users")
+}
+
+/// 页面会话（M5 / FR-1.23）—— PV / UV / 错误率的口径基础
+///
+/// ── 为什么它必须存在 ────────────────────────────────────────────────────
+/// "错误率"的分母是**会话数**，不是事件数也不是用户数：
+/// 一个人写死循环刷了 1 万次错误，事件数口径会算出 99% 的错误率，
+/// 而实际的答案是"他访问的这 1 次里出错了" —— 1/1。
+///
+/// ── 谁写它 ──────────────────────────────────────────────────────────────
+/// **上报进程（API）**在收到带 session_id 的事件时 upsert，不经过队列：
+/// 会话是"访问量"级别的指标，晚几十毫秒没有意义；而走队列会让
+/// 错误率的分母比分子晚到，看板上会短暂出现"错误率 100%"这种假象。
+///
+/// ── 为什么主键带 projectId ─────────────────────────────────────────────
+/// session_id 是浏览器生成的，**同一个浏览器在两个项目里可能算出同一个 id**。
+/// 只按 id 做主键会让两个项目的会话互相覆盖；复合主键同时满足 TC-08
+/// （所有查询都必须带 projectId）。
+///
+/// ── 已知近似（写进界面的那句话）─────────────────────────────────────────
+/// `page_views` 目前每次**性能上报** +1（SDK 每次页面加载发一条性能事件），
+/// 所以它是"有性能采集的页面加载次数"，不是严格意义的 PV。
+/// 真正的 PV 需要 SDK 单独上报 page_view 事件 —— 那需要一个新接口，
+/// 属于下一步，届时只需把 pageViews 的增量改到那条链路上。
+model Session {
+  /// 浏览器生成的会话 ID（UUID 形状，但 DTO 只按长度校验，不与 uuid 强绑）
+  id String @db.VarChar(100)
+
+  /// 所属项目（主键最左前缀，满足 TC-08）
+  projectId String @map("project_id") @db.Uuid
+
+  /// 会话归属的用户标识。可空：SDK 拿不到身份时，只有匿名会话
+  userKey String? @map("user_key") @db.VarChar(100)
+
+  /// 会话开始时刻（客户端时钟）
+  startedAt DateTime @map("started_at") @db.Timestamptz
+
+  /// 最近活动时刻（客户端时钟）。乱序补报时用 GREATEST 保证只前进、不后退
+  lastSeenAt DateTime @map("last_seen_at") @db.Timestamptz
+
+  /// 页面上报次数。口径见文件头"已知近似"
+  pageViews Int @default(0) @map("page_views")
+
+  /// 这个会话里有没有出现过错误 —— 错误率的**分子**就是它
+  hadError Boolean @default(false) @map("had_error")
+
+  /// 外键。Cascade：删项目连带删会话
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, id])
+  /// 概览的 PV / UV / 错误率都按「项目 + 时间窗口」查，索引必须以它为前缀
+  @@index([projectId, startedAt])
+  @@map("sessions")
 }
 
 /// 问题的小时聚合（M5 / B1）—— 一行 =「这个问题在这一小时」

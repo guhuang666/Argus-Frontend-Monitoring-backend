@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { Prisma } from '../../generated/prisma/client';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { ProjectQueueService } from '../queue/project-queue.service';
+import type { SessionsService } from '../sessions/sessions.service';
 
 /**
  * jest 加载不了 generated/prisma/client.ts —— 它是 prisma-client 生成器产的 TS 源码，
@@ -122,6 +123,8 @@ function build(prisma: ReturnType<typeof fakePrisma>, queue: ReturnType<typeof f
     prisma as unknown as PrismaService,
     // 这里只需要 queueFor 一个方法，其余强转掉
     fakeQueues(queue) as unknown as ProjectQueueService,
+    // 会话写入是旁路（失败只 warn），本文件不关心它的行为，给个空实现
+    { touch: async () => undefined } as unknown as SessionsService,
   );
 }
 

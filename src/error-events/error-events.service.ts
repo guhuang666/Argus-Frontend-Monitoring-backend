@@ -7,6 +7,7 @@ import {
   ERROR_EVENT_JOB_OPTIONS,
   toJobId,
 } from '../queue/queue.constants';
+import { SessionsService } from '../sessions/sessions.service';
 import { IngestErrorDto } from './dto/ingest-error.dto';
 
 export interface IngestResult {
@@ -24,6 +25,8 @@ export class ErrorEventsService {
     // 不再是固定的一条队列：S7 起按项目分流（每个项目一条 error-events-<id>），
     // 这样某个项目的积压不会把别的项目堵在队尾
     private readonly queues: ProjectQueueService,
+    // 会话写入（M5）。失败只 warn，绝不影响事件入库 —— 见 SessionsService 的注释
+    private readonly sessions: SessionsService,
   ) {}
 
   /**
@@ -89,6 +92,17 @@ export class ErrorEventsService {
       }
       throw err;
     }
+
+    // 会话写入（M5）：这条事件意味着"这个会话里出过错" → 错误率的分子。
+    // 放在入库之后、入队之前：入库成功才说明事件是真的，
+    // 而它不依赖队列，所以不必排到入队后面。失败只 warn，不影响本次上报。
+    await this.sessions.touch({
+      projectId,
+      sessionId: payload.session_id,
+      userKey: payload.user?.id ?? null,
+      at: payload.timestamp ? new Date(payload.timestamp) : new Date(),
+      hasError: true,
+    });
 
     await this.enqueue(payload.event_id, projectId);
 
@@ -157,6 +171,8 @@ export class ErrorEventsService {
       // 用户维度（M5）：SDK 三档降级的最终结果 —— 账号 ID / 匿名设备 ID / null。
       // 这一列早就存在（error_events.user_id），只是以前没有上行链路，恒为 NULL。
       userId: payload.user?.id ?? null,
+      // 会话（M5）：列早就存在，缺的一直是上行链路；真正写 sessions 表在 ingest 里
+      sessionId: payload.session_id ?? null,
       sdkName: payload.sdk?.name ?? null,
       sdkVersion: payload.sdk?.version ?? null,
       // 版本与环境：M3 的 Sourcemap 按 release 找 map（FR-3.4）。

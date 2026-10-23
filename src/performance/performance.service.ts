@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { Prisma, type PerformanceMetric } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { SessionsService } from '../sessions/sessions.service';
 import { IngestPerfDto } from './dto/ingest-perf.dto';
 
 export interface IngestPerfResult {
@@ -13,7 +14,11 @@ export interface IngestPerfResult {
 export class PerformanceService {
   private readonly logger = new Logger(PerformanceService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // 会话写入（M5）：性能上报同时是"看了一个页面"的证据，给 page_views +1
+    private readonly sessions: SessionsService,
+  ) {}
 
   /**
    * 把收到的性能事件**原样**打到控制台。
@@ -59,6 +64,19 @@ export class PerformanceService {
 
     try {
       await this.prisma.performanceMetric.create({ data: this.toRow(payload, projectId) });
+
+      // 会话写入（M5）：一次性能上报 = 一次页面加载 → page_views +1。
+      // 这是**现有 PV 口径的来源**（见 Session 模型注释的"已知近似"）。
+      // 注意 performanceMetric.create 上面没有赋值，所以这里不看它的返回值。
+      await this.sessions.touch({
+        projectId,
+        sessionId: payload.session_id,
+        userKey: payload.user?.id ?? null,
+        at: payload.timestamp ? new Date(payload.timestamp) : new Date(),
+        hasError: false,
+        pageViews: 1,
+      });
+
       return { event_id: payload.event_id, duplicate: false };
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError) {
@@ -120,6 +138,8 @@ export class PerformanceService {
       // 用户标识。列早就存在，缺的一直是上行链路（DTO 不收 → 这里恒为 NULL）。
       // SDK 拿不到身份时是 null，按匿名处理：不影响指标，只是不参与用户维度统计。
       userId: payload.user?.id ?? null,
+      // 会话（M5）：列早就存在，缺的一直是上行链路；真正写 sessions 表在 ingest 里
+      sessionId: payload.session_id ?? null,
     };
   }
 

@@ -214,4 +214,19 @@ export class IngestPerfDto {
   @ValidateNested()
   @Type(() => PerfUserDto)
   user?: PerfUserDto | null;
+
+  /**
+   * 会话标识（M5 / FR-1.23）。与错误通道的 session_id 同源同形。
+   *
+   * 除了给 sessions 表按会话归并，它还是**现有 PV 口径的依据**：
+   * SDK 每次页面加载发一条性能事件，所以这条上报本身就意味着"看了一个页面"，
+   * `sessions.page_views` 在性能入库时 +1。等 SDK 真正上报 page_view 后，
+   * 这个增量应该挪到那条链路上。
+   *
+   * 可空：SDK 未接入会话时整条指标照常入库，只是不计入 PV/UV。
+   */
+  @IsOptional()
+  @IsString()
+  @Length(1, 100)
+  session_id?: string;
 }

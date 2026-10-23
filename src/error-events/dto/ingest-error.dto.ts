@@ -127,6 +127,18 @@ export class IngestErrorDto {
   user?: UserDto;
 
   /**
+   * 会话标识（M5 / FR-1.23）。同一次访问内的所有事件共享同一个值。
+   *
+   * 长度上限 100 与 sessions.id 的列宽一致。**必须在这里声明**：
+   * whitelist 会把未声明字段静默剥掉 —— 表现是"SDK 明明发了，
+   * sessions 表却一行都没有"，而且不报任何错。
+   */
+  @IsOptional()
+  @IsString()
+  @Length(1, 100)
+  session_id?: string;
+
+  /**
    * 错误发生前的行为轨迹（面包屑）。
    *
    * 这里只做"是个数组"的宽松校验，形状归 SDK 管：最小版每条形如
