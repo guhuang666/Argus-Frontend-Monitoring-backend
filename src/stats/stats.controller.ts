@@ -2,12 +2,14 @@ import { Controller, Get, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ProjectScopeGuard } from '../auth/project-scope.guard';
 import { OverviewQueryDto } from './dto/overview-query.dto';
+import { PerformanceQueryDto } from './dto/performance-query.dto';
 import { StatsService } from './stats.service';
 
 /**
- * 概览统计。
+ * 概览与性能统计。
  *
  * GET /api/v1/stats/overview?projectId=&range=24h
+ * GET /api/v1/stats/performance?projectId=&metric=lcp&range=24h
  *
  * ── 为什么是 `?projectId=` 而不是 `/projects/:projectId/stats/overview` ──
  * SRS §8 写的是路径前缀式。但当前三个读接口（/error、/issues、/performance）
@@ -28,5 +30,22 @@ export class StatsController {
   @UseGuards(JwtAuthGuard, ProjectScopeGuard)
   overview(@Query() query: OverviewQueryDto) {
     return this.service.overview(query.projectId, query.range);
+  }
+
+  /**
+   * 性能分位趋势。
+   *
+   * 与 overview 一样只做参数转发 —— 桶的粒度、补空、null 语义全在 service 里。
+   * 控制器若在这里做任何"聪明的默认值"（比如把 30d 悄悄改成 7d），
+   * 前端就很难解释"我明明传了 30d"。
+   */
+  @Get('performance')
+  @UseGuards(JwtAuthGuard, ProjectScopeGuard)
+  performance(@Query() query: PerformanceQueryDto) {
+    return this.service.performanceTrend(
+      query.projectId,
+      query.metric,
+      query.range,
+    );
   }
 }
