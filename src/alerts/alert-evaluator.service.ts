@@ -217,6 +217,10 @@ export class AlertEvaluatorService implements OnModuleInit, OnModuleDestroy {
           projectId: rule.projectId,
           firedAt: now,
           value,
+          // 触发时的规则快照：规则可以被编辑，历史必须能自己解释自己
+          metric: rule.metric,
+          threshold: rule.threshold,
+          windowMinutes: rule.windowMinutes,
           delivered: result.ok,
           error: result.ok ? null : (result.error ?? '投递失败（未返回原因）'),
         },

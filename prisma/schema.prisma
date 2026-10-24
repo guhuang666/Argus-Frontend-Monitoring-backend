@@ -890,6 +890,21 @@ model AlertEvent {
   /// 只记"触发过"而不记"当时多少"，就没法判断规则是不是设得太灵敏
   value Float
 
+  /// ── 触发时的规则快照（M6-5）───────────────────────────────────────────
+  /// 规则是可以被编辑的：阈值从 10 改成 100 之后，历史里那条 value=22
+  /// 就再也解释不了自己越的是哪条线。所以要留一份"当时"的真相。
+  ///
+  /// 可空而不是 NOT NULL：这一列是后加的，老数据没有；用 NOT NULL + 默认值
+  /// 会让老行显示一个**编造的**阈值，比显示"—"更糟。
+  /// 新写入的行由评估器保证三个字段齐全。
+  metric String? @db.VarChar(30)
+
+  /// 当时的阈值
+  threshold Float?
+
+  /// 当时的统计窗口（分钟）
+  windowMinutes Int? @map("window_minutes")
+
   /// 投递是否成功。
   ///
   /// ⚠ 触发与投递是**两件事**：值越过阈值就该留一条历史，哪怕 webhook 挂了。
@@ -905,5 +920,8 @@ model AlertEvent {
 
   /// 规则详情页的「最近触发记录」、总览的「最近告警」都按这条索引查
   @@index([projectId, firedAt(sort: Desc)])
+  /// 历史页支持「只看某条规则」：按规则筛时 (projectId, firedAt) 用不上，
+  /// 会把项目内所有历史捞出来再过滤
+  @@index([ruleId, firedAt(sort: Desc)])
   @@map("alert_events")
 }

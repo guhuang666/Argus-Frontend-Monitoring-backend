@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { AlertEventsController } from './alert-events.controller';
 import { AlertsController } from './alerts.controller';
 import { AlertsService } from './alerts.service';
 
@@ -13,7 +14,7 @@ import { AlertsService } from './alerts.service';
  * 两个守卫由 @Global 的 AuthModule 提供。
  */
 @Module({
-  controllers: [AlertsController],
+  controllers: [AlertsController, AlertEventsController],
   providers: [AlertsService],
 })
 export class AlertsModule {}

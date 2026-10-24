@@ -1,7 +1,8 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import type { AlertRule, Prisma } from '../../generated/prisma/client';
+import type { AlertEvent, AlertRule, Prisma } from '../../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { CreateAlertRuleDto } from './dto/create-alert-rule.dto';
+import type { ListAlertEventsQueryDto } from './dto/list-alert-events-query.dto';
 import type { UpdateAlertRuleDto } from './dto/update-alert-rule.dto';
 
 /** 脱敏时保留的尾部字符数。飞书/Slack 的 webhook 末尾是随机串，末 6 位不足以复原 */
@@ -100,6 +101,52 @@ export class AlertsService {
   }
 
   /**
+   * 触发历史（M6-5）。
+   *
+   * ── 为什么 include rule 而不是冗余列 ────────────────────────────────────
+   * 列表要显示规则名和渠道，而它们只存在 `alert_rules` 里。规则被删后历史也没了
+   * （Cascade），所以 join 一定命中，不会出现 "rule 为 null" 的分支。
+   *
+   * ── 为什么 from/to 是 [from, to) ───────────────────────────────────────
+   * 与项目里所有时间窗口一致：相邻两个区间不会重复统计边界上的那一条。
+   * 只给 from 或只给 to 都是合法用法，所以用条件展开而不是要求两个都给。
+   */
+  async listEvents(query: ListAlertEventsQueryDto) {
+    const where: Prisma.AlertEventWhereInput = { projectId: query.projectId };
+
+    if (query.ruleId !== undefined) {
+      where.ruleId = query.ruleId;
+    }
+    if (query.delivered !== undefined) {
+      where.delivered = query.delivered;
+    }
+    if (query.from !== undefined || query.to !== undefined) {
+      where.firedAt = {
+        ...(query.from === undefined ? {} : { gte: new Date(query.from) }),
+        ...(query.to === undefined ? {} : { lt: new Date(query.to) }),
+      };
+    }
+
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.alertEvent.findMany({
+        where,
+        orderBy: { firedAt: 'desc' },
+        skip: (query.page - 1) * query.pageSize,
+        take: query.pageSize,
+        include: { rule: { select: { name: true, channel: true } } },
+      }),
+      this.prisma.alertEvent.count({ where }),
+    ]);
+
+    return {
+      items: rows.map(toEventRow),
+      total,
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
+  /**
    * 删除规则。
    *
    * `deleteMany` 而不是 `delete`：同样是为了一次语句里带上 projectId。
@@ -150,6 +197,32 @@ function toRow(row: AlertRule) {
 /** `https://open.feishu.cn/.../abc123` → `***abc123` */
 function maskWebhook(url: string): string {
   return `***${url.slice(-WEBHOOK_TAIL)}`;
+}
+
+/** 历史行 + 它所属规则的展示字段（列表要显示规则名和渠道） */
+type EventWithRule = AlertEvent & { rule: { name: string; channel: string } };
+
+/**
+ * 一行 `alert_events` → 接口响应。
+ *
+ * `metric / threshold / window_minutes` 是**触发时的快照**，不是 join 出来的
+ * 当前配置 —— 规则改过阈值之后，历史里那条 value=22 靠这三个字段才能自解释。
+ * 快照列是后加的，老数据为 null，前端要把它渲染成 "—" 而不是 "0"。
+ */
+function toEventRow(row: EventWithRule) {
+  return {
+    id: row.id,
+    rule_id: row.ruleId,
+    rule_name: row.rule.name,
+    channel: row.rule.channel,
+    fired_at: row.firedAt,
+    value: row.value,
+    metric: row.metric,
+    threshold: row.threshold,
+    window_minutes: row.windowMinutes,
+    delivered: row.delivered,
+    error: row.error,
+  };
 }
 
 /**

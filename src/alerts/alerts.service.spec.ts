@@ -3,6 +3,7 @@ import type { AlertRule } from '../../generated/prisma/client';
 import type { PrismaService } from '../prisma/prisma.service';
 import { AlertsService } from './alerts.service';
 import type { CreateAlertRuleDto } from './dto/create-alert-rule.dto';
+import type { ListAlertEventsQueryDto } from './dto/list-alert-events-query.dto';
 import type { UpdateAlertRuleDto } from './dto/update-alert-rule.dto';
 
 /**
@@ -56,6 +57,8 @@ function fakePrisma(init: {
   deleteCount?: number;
   current?: AlertRule | null;
   updatedRow?: AlertRule;
+  eventRows?: unknown[];
+  eventTotal?: number;
 } = {}) {
   const calls = {
     findMany: [] as Array<Record<string, unknown>>,
@@ -64,9 +67,13 @@ function fakePrisma(init: {
     findUniqueOrThrow: [] as Array<Record<string, unknown>>,
     findFirst: [] as Array<Record<string, unknown>>,
     deleteMany: [] as Array<Record<string, unknown>>,
+    eventFindMany: [] as Array<Record<string, unknown>>,
+    eventCount: [] as Array<Record<string, unknown>>,
   };
 
   const prisma = {
+    // 规则列表与历史列表都用了 $transaction([findMany, count])
+    $transaction: (ops: Array<Promise<unknown>>) => Promise.all(ops),
     alertRule: {
       findMany: (args: Record<string, unknown>) => {
         calls.findMany.push(args);
@@ -91,6 +98,16 @@ function fakePrisma(init: {
       deleteMany: (args: Record<string, unknown>) => {
         calls.deleteMany.push(args);
         return Promise.resolve({ count: init.deleteCount ?? 1 });
+      },
+    },
+    alertEvent: {
+      findMany: (args: Record<string, unknown>) => {
+        calls.eventFindMany.push(args);
+        return Promise.resolve(init.eventRows ?? []);
+      },
+      count: (args: Record<string, unknown>) => {
+        calls.eventCount.push(args);
+        return Promise.resolve(init.eventTotal ?? 0);
       },
     },
   };
@@ -232,5 +249,118 @@ describe('AlertsService.remove', () => {
     const { service } = build({ deleteCount: 0 });
 
     await expect(service.remove(PROJECT, RULE)).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+
+/* ───────────────────────── 告警历史（M6-5）───────────────────────── */
+
+/** 一行 alert_events + 它所属规则的展示字段 */
+const EVENT = {
+  id: 'e1',
+  ruleId: RULE,
+  projectId: PROJECT,
+  firedAt: new Date('2026-10-24T09:00:00.000Z'),
+  value: 22,
+  metric: 'events',
+  threshold: 10,
+  windowMinutes: 30,
+  delivered: true,
+  error: null,
+  rule: { name: '错误暴涨', channel: 'feishu' },
+};
+
+function eventQuery(overrides: Partial<ListAlertEventsQueryDto> = {}): ListAlertEventsQueryDto {
+  return { projectId: PROJECT, page: 1, pageSize: 20, ...overrides } as ListAlertEventsQueryDto;
+}
+
+describe('AlertsService.listEvents', () => {
+  it('不加筛选时 where 只有 projectId，并按触发时间倒序', async () => {
+    const { service, calls } = build();
+
+    await service.listEvents(eventQuery());
+
+    expect(calls.eventFindMany[0]).toMatchObject({
+      where: { projectId: PROJECT },
+      orderBy: { firedAt: 'desc' },
+      skip: 0,
+      take: 20,
+    });
+  });
+
+  it('三个筛选条件都落到 where 上（时间用左闭右开）', async () => {
+    const { service, calls } = build();
+
+    await service.listEvents(
+      eventQuery({
+        ruleId: RULE,
+        delivered: false,
+        from: '2026-10-24T00:00:00.000Z',
+        to: '2026-10-25T00:00:00.000Z',
+      }),
+    );
+
+    expect(calls.eventFindMany[0]?.where).toEqual({
+      projectId: PROJECT,
+      ruleId: RULE,
+      delivered: false,
+      firedAt: {
+        gte: new Date('2026-10-24T00:00:00.000Z'),
+        lt: new Date('2026-10-25T00:00:00.000Z'),
+      },
+    });
+  });
+
+  it('只给 from 时不会凭空补一个 to', async () => {
+    const { service, calls } = build();
+
+    await service.listEvents(eventQuery({ from: '2026-10-24T00:00:00.000Z' }));
+
+    expect(calls.eventFindMany[0]?.where).toEqual({
+      projectId: PROJECT,
+      firedAt: { gte: new Date('2026-10-24T00:00:00.000Z') },
+    });
+  });
+
+  it('分页换算成 skip/take，count 用同一份 where', async () => {
+    const { service, calls } = build({ eventTotal: 42 });
+
+    const result = await service.listEvents(eventQuery({ page: 3, pageSize: 10 }));
+
+    expect(calls.eventFindMany[0]).toMatchObject({ skip: 20, take: 10 });
+    expect(calls.eventCount[0]?.where).toEqual({ projectId: PROJECT });
+    expect(result.total).toBe(42);
+    expect(result.page).toBe(3);
+  });
+
+  it('响应里带规则名、渠道和触发时的快照字段', async () => {
+    const { service } = build({ eventRows: [EVENT], eventTotal: 1 });
+
+    const result = await service.listEvents(eventQuery());
+    const item = result.items[0];
+
+    expect(item).toMatchObject({
+      rule_id: RULE,
+      rule_name: '错误暴涨',
+      channel: 'feishu',
+      value: 22,
+      metric: 'events',
+      threshold: 10,
+      window_minutes: 30,
+      delivered: true,
+      error: null,
+    });
+    expect(item?.fired_at).toBeInstanceOf(Date);
+  });
+
+  it('老数据没有快照字段时原样返回 null（前端渲染成 —，不能编造 0）', async () => {
+    const { service } = build({
+      eventRows: [{ ...EVENT, metric: null, threshold: null, windowMinutes: null }],
+      eventTotal: 1,
+    });
+
+    const result = await service.listEvents(eventQuery());
+
+    expect(result.items[0]?.threshold).toBeNull();
+    expect(result.items[0]?.window_minutes).toBeNull();
   });
 });
