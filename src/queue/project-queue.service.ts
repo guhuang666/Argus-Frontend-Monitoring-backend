@@ -45,8 +45,25 @@ export class ProjectQueueService implements OnModuleDestroy {
     return queue;
   }
 
-  async onModuleDestroy(): Promise<void> {
-    await Promise.all(
+  /**
+   * 所有**已创建**的队列（projectId + Queue 实例）。
+   *
+   * 给指标采集用（M6-7 的队列积压）。只返回被上报链路碰过的队列：
+   * 没有流量的项目不该为了一个数字凭空多一条 Redis 连接，指标里它显示为
+   * "没有数据"就够了。
+   *
+   * projectId 从队列名反解（`error-events-<uuid>`）。Map 的 key 就是队列名，
+   * 再存一份 projectId 等于维护两份真相，改名时迟早对不上。
+   */
+  entries(): Array<{ projectId: string; queue: Queue<ErrorEventJobData> }> {
+    const prefix = `${ERROR_EVENT_QUEUE}-`;
+    return [...this.queues.entries()].map(([name, queue]) => ({
+      projectId: name.startsWith(prefix) ? name.slice(prefix.length) : name,
+      queue,
+    }));
+  }
+
+  async onModuleDestroy(): Promise<void> {    await Promise.all(
       [...this.queues.values()].map((queue) =>
         queue.close().catch((err: unknown) => {
           this.logger.warn(`关闭队列失败: ${String(err)}`);

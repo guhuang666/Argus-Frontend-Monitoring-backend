@@ -8,6 +8,7 @@ import {
   toJobId,
 } from '../queue/queue.constants';
 import { SessionsService } from '../sessions/sessions.service';
+import { MetricsService } from '../metrics/metrics.service';
 import { IngestErrorDto } from './dto/ingest-error.dto';
 
 export interface IngestResult {
@@ -27,6 +28,8 @@ export class ErrorEventsService {
     private readonly queues: ProjectQueueService,
     // 会话写入（M5）。失败只 warn，绝不影响事件入库 —— 见 SessionsService 的注释
     private readonly sessions: SessionsService,
+    // 指标（M6-7）。只在上报**成功入库**后 +1，属于"顺手记一笔"，不参与任何业务判断
+    private readonly metrics: MetricsService,
   ) {}
 
   /**
@@ -92,6 +95,10 @@ export class ErrorEventsService {
       }
       throw err;
     }
+
+    // 指标（M6-7）：只有入库成功才 +1。重复上报在上面已经 return 了，
+    // 所以这个数等于"真正收下了多少条"，而不是"被请求了多少次"
+    this.metrics.recordIngest(projectId);
 
     // 会话写入（M5）：这条事件意味着"这个会话里出过错" → 错误率的分子。
     // 放在入库之后、入队之前：入库成功才说明事件是真的，

@@ -6,6 +6,7 @@ import { ErrorEventsModule } from './error-events/error-events.module';
 import { HealthModule } from './health/health.module';
 import { IssuesModule } from './issues/issues.module';
 import { KeysModule } from './keys/keys.module';
+import { MetricsModule } from './metrics/metrics.module';
 import { PerformanceModule } from './performance/performance.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProjectsModule } from './projects/projects.module';
@@ -46,6 +47,8 @@ import { StatsModule } from './stats/stats.module';
     HealthModule,
     // 告警规则 CRUD（M6-2）。评估器（M6-3）刻意不进这里 —— 那是 worker 进程的事。
     AlertsModule,
+    // 指标（M6-7）：GET /metrics。@Global，上报链路与限流守卫都要往里 +1。
+    MetricsModule,
   ],
 })
 export class AppModule {}

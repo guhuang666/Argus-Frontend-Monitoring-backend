@@ -9,6 +9,7 @@ import {
 import type { Response } from 'express';
 import { extractIngestKey } from '../common/ingest-key';
 import { KeysService } from '../keys/keys.service';
+import { MetricsService } from '../metrics/metrics.service';
 import type { RequestWithIngest } from './ingest-context';
 import { RateLimitService } from './rate-limit.service';
 
@@ -39,6 +40,9 @@ export class IngestRateLimitGuard implements CanActivate {
   constructor(
     private readonly keys: KeysService,
     private readonly limiter: RateLimitService,
+    // 指标（M6-7）：被拒的那一条在 Prometheus 里也要能看见，
+    // 否则"上报量掉了"和"被限流了"在监控上长得一模一样
+    private readonly metrics: MetricsService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -73,6 +77,9 @@ export class IngestRateLimitGuard implements CanActivate {
       // FR-6.4：这一条是被丢掉的，记一笔 —— 否则客户只能从"事件变少了"猜到
       // 自己被限流，而那种怀疑很容易被误判成"SDK 坏了"
       await this.limiter.recordDropped(project.projectId);
+      // 同一件事在指标里也记一笔：Redis 的丢件计数是给**客户**看的，
+      // 指标是给**运维**看的（能在 Grafana 上看到什么时候开始丢）
+      this.metrics.recordRejected(project.projectId, 'rate_limit');
 
       // 只记日志，不把 projectId 拼进响应体 —— 响应可能被浏览器控制台截图外传
       this.logger.warn(

@@ -3,6 +3,7 @@ import { Prisma } from '../../generated/prisma/client';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { ProjectQueueService } from '../queue/project-queue.service';
 import type { SessionsService } from '../sessions/sessions.service';
+import type { MetricsService } from '../metrics/metrics.service';
 
 /**
  * jest 加载不了 generated/prisma/client.ts —— 它是 prisma-client 生成器产的 TS 源码，
@@ -125,6 +126,8 @@ function build(prisma: ReturnType<typeof fakePrisma>, queue: ReturnType<typeof f
     fakeQueues(queue) as unknown as ProjectQueueService,
     // 会话写入是旁路（失败只 warn），本文件不关心它的行为，给个空实现
     { touch: async () => undefined } as unknown as SessionsService,
+    // 指标也是旁路（M6-7）：记不记都不影响入库结果，给个空实现即可
+    { recordIngest: () => undefined, recordRejected: () => undefined } as unknown as MetricsService,
   );
 }
 
