@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { AlertsModule } from './alerts/alerts.module';
 import { AuthModule } from './auth/auth.module';
 import { ErrorEventsModule } from './error-events/error-events.module';
 import { HealthModule } from './health/health.module';
@@ -43,6 +44,8 @@ import { StatsModule } from './stats/stats.module';
     // 健康检查（M6-0）：/api/v1/health/live 与 /ready。
     // 刻意只放 API 进程 —— worker 没有 HTTP 端口，探针无处可打。
     HealthModule,
+    // 告警规则 CRUD（M6-2）。评估器（M6-3）刻意不进这里 —— 那是 worker 进程的事。
+    AlertsModule,
   ],
 })
 export class AppModule {}
