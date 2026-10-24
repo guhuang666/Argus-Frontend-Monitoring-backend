@@ -3,6 +3,7 @@ import { Logger, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import type { Queue } from 'bullmq';
+import { EvaluationModule } from './alerts/evaluation.module';
 import { GroupingModule } from './grouping/grouping.module';
 import { ProjectWorkerManager } from './grouping/project-worker.manager';
 import { PrismaModule } from './prisma/prisma.module';
@@ -44,6 +45,9 @@ const REDIS_READY_TIMEOUT_MS = 10_000;
     // GroupingModule 带来 ErrorEventProcessor —— 也就是"消费"这件事本身。
     // 只有本进程 import 它，API 进程绝不会（见 grouping.module.ts 的警告）。
     GroupingModule,
+    // 告警评估器（M6-3）：每 60 秒醒一次，按规则算窗口值、超阈值就推送。
+    // 同样只在 worker —— 放进 API 进程会让每个副本都发一遍消息。
+    EvaluationModule,
   ],
 })
 class WorkerModule {}
