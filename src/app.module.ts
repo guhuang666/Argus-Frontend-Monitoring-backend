@@ -1,9 +1,8 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
 import { ErrorEventsModule } from './error-events/error-events.module';
+import { HealthModule } from './health/health.module';
 import { IssuesModule } from './issues/issues.module';
 import { KeysModule } from './keys/keys.module';
 import { PerformanceModule } from './performance/performance.module';
@@ -41,8 +40,9 @@ import { StatsModule } from './stats/stats.module';
     SourcemapsModule,
     // 概览统计（批次 C）：趋势 + 总量 + 问题数，全部读 issue_stats_hourly。
     StatsModule,
+    // 健康检查（M6-0）：/api/v1/health/live 与 /ready。
+    // 刻意只放 API 进程 —— worker 没有 HTTP 端口，探针无处可打。
+    HealthModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
 })
 export class AppModule {}
