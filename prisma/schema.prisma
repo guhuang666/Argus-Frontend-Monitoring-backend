@@ -158,6 +158,10 @@ model Project {
   /// 反向关系：本项目的页面会话（M5）。PV/UV/错误率的口径基础
   sessions           Session[]
 
+  /// 反向关系：本项目的告警规则（M6-1）。删项目时由 alert_rules 的
+  /// 外键 ON DELETE CASCADE 连带删除 —— 见 AlertRule 的注释
+  alertRules         AlertRule[]
+
   /// 同组织内项目名不允许重复（MVP-B）。
   /// 在数据库层拦而不是应用层"先查后插"：并发创建两个同名项目时，
   /// 应用层的检查会同时通过，最后切换器里出现两个一模一样的条目 —— 人分不清。
@@ -758,4 +762,148 @@ model SourcemapFile {
   /// 幂等重传靠它做 upsert：同版本同路径再次上传 = 覆盖，不新增行（FR-3.3）
   @@unique([releaseId, artifactPath])
   @@map("sourcemap_files")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 告警（M6-1 / FR-7）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 告警规则 —— 一行 =「这个项目的某个指标，在某窗口内越过阈值就发一条消息」
+///
+/// ── 为什么触发历史是独立表，而不是规则上的一个 JSON 列 ───────────────────
+/// 历史要能按时间倒序翻页、要能回答"这条规则本周误报了几次"、还要能查
+/// "它的 webhook 是不是一直发不出去"。这三件事在 JSON 数组里只能全表捞出来
+/// 在内存里算。独立表配 (project_id, fired_at DESC) 才是能随数据量长大的形状。
+///
+/// ── 为什么 metric / comparator / channel 用 String 而不用 enum ──────────
+/// 取值由**应用层**定义并校验（DTO 的 @IsIn），数据库只当字符串存。
+/// 用 enum 的话，加一个新指标（比如 error_rate 之后再接 apdex）就要一次
+/// migration —— 而这次改动对表结构毫无影响，只是多一个分支。
+/// 代价是库里没有枚举约束，所以写入方必须收敛到一处（M6-2 的 DTO 与
+/// M6-3 的评估器共用同一份白名单，不许各写一份）。
+///
+/// ── 评估与投递必须跑在 worker 进程（重要）───────────────────────────────
+/// 用 BullMQ 可重复任务每分钟评估一次，且只在 worker 里注册。
+/// API 进程是可以水平扩容的：每个实例都评估一遍 = 同一次触发发 N 条消息。
+/// 这条纪律与"grouping 模块绝不进 app.module.ts"是同一个原因。
+model AlertRule {
+  /// 主键
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 所属项目（TC-08：所有查询都显式带 projectId）
+  projectId String @map("project_id") @db.Uuid
+
+  /// 规则名，给人看的，如「线上错误数突增」。不参与任何判定逻辑
+  name String @db.VarChar(100)
+
+  /// 被监控的指标。取值：events | users | new_issues | error_rate | lcp_p75
+  ///
+  /// ⚠ 每个指标读哪张表是**口径问题**，不是实现细节：
+  ///   · events / users 读 `error_events` 明细 —— **不能**读 issue_stats_hourly，
+  ///     那是小时粒度，5 分钟的窗口在它上面算不出来（只会取到整整一小时）
+  ///   · new_issues 读 `error_groups.first_seen`
+  ///   · error_rate 读 `sessions`（出过错误的会话 / 总会话）
+  ///   · lcp_p75 读 `performance_metrics`（percentile_cont(0.75)）
+  metric String @db.VarChar(30)
+
+  /// 比较方向。取值：gt（大于阈值触发）| lt（小于阈值触发）
+  ///
+  /// lt 不是凑数的：可用性百分比、健康检查通过率这类指标是**低于**某值才该告警。
+  /// 做成数据而不是写死在代码里，执行器就只有一个，不用为方向写两条分支
+  comparator String @db.VarChar(4)
+
+  /// 阈值。Float 而不是 Int：error_rate 是 0~1 的小数，lcp 是毫秒浮点
+  threshold Float
+
+  /// 统计窗口（分钟）。窗口语义是 `[now - windowMinutes, now)` 半开区间：
+  /// 闭区间会让相邻两次评估都把边界上那一秒算进去，长跑下来整体偏高
+  windowMinutes Int @map("window_minutes")
+
+  /// 只统计这个环境的数据（如 production）。NULL = 不限环境（FR-7.3）
+  environment String? @db.VarChar(50)
+
+  /// 只统计这个版本的数据（如 web@1.2.4）。NULL = 不限版本
+  release String? @db.VarChar(100)
+
+  /// 投递渠道。取值：feishu | slack | dingtalk。
+  /// 三家的 payload 形状不同（飞书是 {msg_type, content}，Slack 是 {text}），
+  /// 由 M6-4 的投递器按它分派
+  channel String @db.VarChar(20)
+
+  /// Webhook 地址。**这是密钥**——它能往群里发消息。
+  ///
+  /// 明文存的理由：规则要能被编辑，编辑页至少得能显示尾部。
+  /// 代价是任何一次库导出/日志打印都等于泄露，所以配两条纪律：
+  ///   · 所有读接口一律脱敏（只回末尾 6 位），见 M6-2
+  ///   · 日志里只打规则 id，绝不打完整 URL，见 M6-4
+  webhookUrl String @map("webhook_url") @db.VarChar(500)
+
+  /// 静默期（分钟）。触发一次后，接下来这么久之内不再重复发。
+  /// 与 lastFiredAt 配合；判重**必须**走原子条件更新，见 M6-3
+  silenceMinutes Int @default(30) @map("silence_minutes")
+
+  /// 总开关。停用的规则不参与评估，历史保留
+  enabled Boolean @default(true)
+
+  /// 上次触发时刻。NULL = 从未触发过。
+  ///
+  /// ⚠ 它同时是静默窗口的判定依据，所以写入必须是**条件更新**：
+  ///     UPDATE alert_rules SET last_fired_at = now()
+  ///      WHERE id = $1 AND (last_fired_at IS NULL OR last_fired_at < now() - silence)
+  /// 先读后写会让两个并发评估都通过检查 —— 同一个问题在群里出现两条消息，
+  /// 而这正是告警最伤信任的一种表现
+  lastFiredAt DateTime? @map("last_fired_at") @db.Timestamptz
+
+  /// 创建时间。服务端时钟
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  /// 触发历史（外键在 AlertEvent.ruleId 那一侧）
+  events AlertEvent[]
+
+  /// 所属项目（外键）。Cascade：删项目连带删规则。
+  /// 没有这条约束的话，删掉的项目会留下"孤儿规则"继续被评估、
+  /// 继续往已经废弃的群里发消息 —— 而且页面上已经看不到它们了，无从排查
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// 评估器的唯一查询形状：「这个项目里所有启用的规则」。
+  /// 同时充当外键 project_id 的支撑索引
+  @@index([projectId, enabled])
+  @@map("alert_rules")
+}
+
+/// 告警触发历史 —— 一行 =「这条规则在这一刻被触发了一次」
+model AlertEvent {
+  /// 主键
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 触发的规则。Cascade：删规则连带删历史（验收项）
+  ruleId String @map("rule_id") @db.Uuid
+
+  /// 所属项目。**冗余列**（本可以从规则推出来），但列表页要按"项目 + 时间倒序"
+  /// 翻页，不带它就得 JOIN 规则表才能用上索引
+  projectId String @map("project_id") @db.Uuid
+
+  /// 触发时刻。服务端时钟
+  firedAt DateTime @default(now()) @map("fired_at") @db.Timestamptz
+
+  /// 触发时算出来的实际值。复盘用：「阈值 100，当时 187」——
+  /// 只记"触发过"而不记"当时多少"，就没法判断规则是不是设得太灵敏
+  value Float
+
+  /// 投递是否成功。
+  ///
+  /// ⚠ 触发与投递是**两件事**：值越过阈值就该留一条历史，哪怕 webhook 挂了。
+  /// 失败必须留痕（delivered=false + error），否则"为什么我没收到告警"
+  /// 这个问题永远查不出来 —— 用户只看到"规则明明配了，群里什么都没有"
+  delivered Boolean @default(false)
+
+  /// 投递失败的原因：HTTP 状态码 / 超时 / 群机器人返回的 errcode。成功时为 NULL
+  error String? @db.VarChar(500)
+
+  /// 所属规则（外键）。Cascade：删规则时清掉它的历史
+  rule AlertRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  /// 规则详情页的「最近触发记录」、总览的「最近告警」都按这条索引查
+  @@index([projectId, firedAt(sort: Desc)])
+  @@map("alert_events")
 }
