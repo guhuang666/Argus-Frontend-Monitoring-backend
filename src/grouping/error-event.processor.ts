@@ -3,11 +3,13 @@ import { Injectable, Logger } from '@nestjs/common';
 import type { Job, Queue } from 'bullmq';
 import { randomUUID } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
+import { WorkerMetricsService } from '../metrics/worker-metrics.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   DLQ_JOB_OPTIONS,
   ERROR_EVENT_DLQ,
   ERROR_EVENT_JOB,
+  ERROR_EVENT_QUEUE,
   toJobId,
   type ErrorEventDlqData,
   type ErrorEventJobData,
@@ -112,6 +114,9 @@ export class ErrorEventProcessor {
     @InjectQueue(ERROR_EVENT_DLQ)
     private readonly dlq: Queue<ErrorEventDlqData>,
     private readonly sourcemaps: SourcemapLookupService,
+    // 指标（M6-7）：只登记"进了死信"这一件事。
+    // 成功/失败的计数在 ProjectWorkerManager 上挂（那里是所有 Worker 的创建点）
+    private readonly metrics: WorkerMetricsService,
   ) {}
 
   /**
@@ -436,6 +441,9 @@ export class ErrorEventProcessor {
         ...DLQ_JOB_OPTIONS,
         jobId: `${toJobId(eventId)}-${randomUUID()}`,
       });
+      // 只有真的写进 DLQ 才记这一笔。写失败时事件仍然丢了，
+      // 但它并没有"进入死信队列"——把失败记成成功会让这个指标骗人
+      this.metrics.recordDlq(projectIdOf(job.queueName));
       this.logger.error(
         `重试 ${job.attemptsMade} 次仍失败，已转入 DLQ: event_id=${eventId} 原因=${err.message}`,
       );
@@ -454,4 +462,17 @@ export class ErrorEventProcessor {
 function truncate(value: string, limit: number): string {
   const points = Array.from(value);
   return points.length <= limit ? value : `${points.slice(0, limit).join('')}…`;
+}
+
+/**
+ * 从队列名反解项目 id（`error-events-<uuid>` → `<uuid>`）。
+ *
+ * DLQ 的 job 载荷里只有 eventId（见 queue.constants 的"只带主键"约定），
+ * 但指标想按项目分。队列名是唯一现成、且一定正确的来源 ——
+ * 拿不到就记 `unknown`，绝不让一个畸形名字把整条失败处理链路搞崩。
+ */
+function projectIdOf(queueName: string | undefined): string {
+  const prefix = `${ERROR_EVENT_QUEUE}-`;
+  if (typeof queueName !== 'string') return 'unknown';
+  return queueName.startsWith(prefix) ? queueName.slice(prefix.length) : 'unknown';
 }

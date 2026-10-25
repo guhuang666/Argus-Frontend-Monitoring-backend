@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import type { Job, Queue } from 'bullmq';
+import type { WorkerMetricsService } from '../metrics/worker-metrics.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import { DLQ_JOB_OPTIONS, ERROR_EVENT_JOB } from '../queue/queue.constants';
 import { ErrorEventProcessor } from './error-event.processor';
@@ -278,11 +279,16 @@ function build(
   prisma: ReturnType<typeof fakePrisma>,
   dlq: ReturnType<typeof fakeDlq>,
   lookup: SourcemapLookupService = DEGRADED_LOOKUP,
+  metrics: { recordDlq: (projectId: string) => void; recordAttempt: (r: string) => void } = {
+    recordDlq: () => undefined,
+    recordAttempt: () => undefined,
+  },
 ) {
   return new ErrorEventProcessor(
     prisma as unknown as PrismaService,
     dlq as unknown as Queue,
     lookup,
+    metrics as unknown as WorkerMetricsService,
   );
 }
 
@@ -297,6 +303,8 @@ function jobLike(overrides: {
     data: { eventId: overrides.eventId ?? 'evt-1' },
     attemptsMade: overrides.attemptsMade ?? 1,
     opts: { attempts: overrides.attempts ?? 3 },
+    // DLQ 指标要按项目分，项目 id 从队列名反解（processor 里的 projectIdOf）
+    queueName: `error-events-${TEST_PROJECT}`,
   } as unknown as Job<{ eventId: string }>;
 }
 
@@ -684,6 +692,39 @@ describe('ErrorEventProcessor', () => {
       expect(
         logged.some((l) => l.includes('已转入 DLQ') && l.includes('evt-1')),
       ).toBe(true);
+    });
+
+    it('转入 DLQ 成功 → 记一次 DLQ 指标，标签是队列名反解出的项目 id', async () => {
+      const recorded: string[] = [];
+      const metrics = {
+        recordDlq: (projectId: string) => recorded.push(projectId),
+        recordAttempt: () => undefined,
+      };
+
+      await build(fakePrisma({}), fakeDlq(), DEGRADED_LOOKUP, metrics).onFailed(
+        jobLike({ attemptsMade: 3, attempts: 3 }),
+        new Error('ECONNREFUSED'),
+      );
+
+      expect(recorded).toEqual([TEST_PROJECT]);
+    });
+
+    it('DLQ 写入失败 → 不记 DLQ 指标（记了就是在说假话）', async () => {
+      const recorded: string[] = [];
+      const metrics = {
+        recordDlq: (projectId: string) => recorded.push(projectId),
+        recordAttempt: () => undefined,
+      };
+      const dlq = fakeDlq({
+        add: () => Promise.reject(new Error('redis down')),
+      });
+
+      await build(fakePrisma({}), dlq, DEGRADED_LOOKUP, metrics).onFailed(
+        jobLike({ attemptsMade: 3, attempts: 3 }),
+        new Error('boom'),
+      );
+
+      expect(recorded).toEqual([]);
     });
 
     it('DLQ 的 jobId 带时间戳：同一事件再次失败不会被去重吃掉', async () => {

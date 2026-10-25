@@ -16,9 +16,10 @@ import { MetricsService } from './metrics.service';
  * 队列积压指标要在抓取时去问 BullMQ 要数字，拿的是 ProjectQueueService。
  * 它由 QueueModule 提供并 export。
  *
- * ⚠️ 本模块只被 app.module.ts import：指标端点由 API 进程暴露。
- * worker 进程暂时不暴露 /metrics（它没有 HTTP 端口，要单独起一个，
- * 那是 v1 的事）。
+ * ⚠️ 本模块只被 app.module.ts import：这是 **API 进程**的指标端点。
+ * worker 进程的归并指标（job 尝试次数 / DLQ）在它自己的 registry 里，
+ * 由 `WorkerMetricsServerService` 在 9464 端口单独暴露 —— 两个进程的内存
+ * 不互通，跨进程中转只会多一条会失败的链路。
  */
 @Global()
 @Module({

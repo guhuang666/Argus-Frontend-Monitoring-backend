@@ -44,6 +44,44 @@ export const ingestRejectedTotal = new Counter({
   registers: [registry],
 });
 
+/* ─────────────────────── worker 侧指标（M6-7 v1）─────────────────────── */
+
+/**
+ * 归并 job 的**尝试**次数（不是 job 数）。
+ *
+ * `succeeded` = Worker 的 completed 事件（一个 job 最多贡献 1 次）；
+ * `failed` = **每一次失败的尝试**（一个重试 3 次的 job 会贡献 3 次）。
+ *
+ * ── 为什么名字是 attempts 而不是 processed ──────────────────────────────
+ * 叫 `jobs_processed` 时，一个重试 3 次的 job 看起来像"3 个 job 失败了"。
+ * 名字里带 attempts，读的人一眼就知道分母是"尝试次数"：
+ *   重试率 = failed / (succeeded + failed)
+ *   处理速率 = succeeded 的 rate()
+ * 想知道"真正丢了多少"，看 `argus_dlq_jobs_total`（那才是 job 口径）。
+ *
+ * 刻意不带 project_id：这是进程级吞吐，按项目拆会让序列数乘上项目数；
+ * 想知道"哪个项目慢"，看队列积压那条 Gauge 就够了。
+ */
+export const jobAttemptsTotal = new Counter({
+  name: 'argus_job_attempts_total',
+  help: '归并 job 的处理尝试次数（按结果分）',
+  labelNames: ['result'],
+  registers: [registry],
+});
+
+/**
+ * 进入死信队列的 job 数。
+ *
+ * 这个数字**应当长期为 0**。只要它涨，就说明有事件重试 3 次仍失败、
+ * 已经被转进 DLQ 等人捞 —— 是"数据正在丢"的直接证据，值得单独告警。
+ */
+export const dlqJobsTotal = new Counter({
+  name: 'argus_dlq_jobs_total',
+  help: '转入死信队列的 job 数',
+  labelNames: ['project_id'],
+  registers: [registry],
+});
+
 /**
  * 读队列长度的函数。由 MetricsService 在构造时注入。
  *

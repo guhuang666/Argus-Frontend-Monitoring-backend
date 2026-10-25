@@ -6,6 +6,7 @@ import type { Queue } from 'bullmq';
 import { EvaluationModule } from './alerts/evaluation.module';
 import { GroupingModule } from './grouping/grouping.module';
 import { ProjectWorkerManager } from './grouping/project-worker.manager';
+import { WorkerMetricsModule } from './metrics/worker-metrics.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { PrismaService } from './prisma/prisma.service';
 import { ProjectQueueService } from './queue/project-queue.service';
@@ -48,6 +49,9 @@ const REDIS_READY_TIMEOUT_MS = 10_000;
     // 告警评估器（M6-3）：每 60 秒醒一次，按规则算窗口值、超阈值就推送。
     // 同样只在 worker —— 放进 API 进程会让每个副本都发一遍消息。
     EvaluationModule,
+    // 指标埋点（M6-7 v1）：目前只有计数，不暴露端口。
+    // 放在这里是为了让 GroupingModule 里的处理器和管理器能注入它。
+    WorkerMetricsModule,
   ],
 })
 class WorkerModule {}

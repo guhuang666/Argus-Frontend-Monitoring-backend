@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { WorkerMetricsModule } from '../metrics/worker-metrics.module';
 import { QueueModule } from '../queue/queue.module';
 import { ErrorEventProcessor } from './error-event.processor';
 import { ProjectWorkerManager } from './project-worker.manager';
@@ -24,7 +25,7 @@ import { SourcemapLookupService } from './sourcemap-lookup.service';
  * normalize.ts 与 fingerprint.ts 都是纯函数，不依赖 Nest 容器，不需要在这里注册。
  */
 @Module({
-  imports: [QueueModule],
+  imports: [QueueModule, WorkerMetricsModule],
   // SourcemapLookupService 只给 Worker 用（查 sourcemap_files + 读 uploads/），
   // 放在这里而不是 sourcemaps/：那个目录是 API 进程的上传侧，两边的依赖不该混
   providers: [ErrorEventProcessor, ProjectWorkerManager, SourcemapLookupService],

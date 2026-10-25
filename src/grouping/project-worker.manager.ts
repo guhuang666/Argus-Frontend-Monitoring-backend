@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Worker, type ConnectionOptions, type Job } from 'bullmq';
+import { WorkerMetricsService } from '../metrics/worker-metrics.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { buildRedisConnection } from '../queue/redis-connection';
 import { projectQueueName, type ErrorEventJobData } from '../queue/queue.constants';
@@ -60,6 +61,9 @@ export class ProjectWorkerManager implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     private readonly processor: ErrorEventProcessor,
+    // 指标（M6-7）：统计的是"进程处理了多少 job"，与业务无关，
+    // 所以挂在 manager 这一层（所有 Worker 的唯一创建点），而不是处理器里
+    private readonly metrics: WorkerMetricsService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -143,7 +147,16 @@ export class ProjectWorkerManager implements OnModuleInit, OnModuleDestroy {
     // 失败处理（含转 DLQ）留在 processor 里，这里只负责转发 ——
     // 同一个逻辑被 N 个 Worker 复用，不该复制 N 份
     worker.on('failed', (job, err) => {
+      // 失败**每次尝试**都记一笔（含还会重试的），这样 failed/succeeded
+      // 的比值才等于重试率；只记"最终失败"会把重试期间的问题藏起来
+      this.metrics.recordAttempt('failed');
       void this.processor.onFailed(job, err);
+    });
+
+    // 成功处理完一个 job（含幂等跳过的情况：那也算"处理过了"；
+    // 真正的"重复投递"由处理器内部识别，指标层不重复判断）
+    worker.on('completed', () => {
+      this.metrics.recordAttempt('succeeded');
     });
 
     // 不挂这个监听也不会崩（bullmq 的 emit 兜了 try/catch），
