@@ -1,0 +1,23 @@
+# Grafana 数据源自动配置（M6-8）
+#
+# 为什么用 provisioning 文件而不是在界面上手动点：
+#   ① 换台机器/重装容器后不用再手点一遍
+#   ② "docker compose up 就该能看到图" 才是一键部署该有的样子
+#   ③ 数据源的 uid 钉死成 argus-prometheus —— dashboard.json 里引用它，
+#      两边对得上才能开箱即用（手点创建的话 uid 是随机的，导入面板会报
+#      "Datasource not found"）。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: argus-prometheus
+    type: prometheus
+    access: proxy
+    # 用容器服务名而不是 localhost：Grafana 与 Prometheus 在同一个 compose 网络里，
+    # 服务名 `prometheus` 会被 Docker 内置 DNS 解析到它的容器 IP
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      # 与 prometheus.yml 的 scrape_interval 对齐，让 rate() 的区间更准
+      timeInterval: 15s

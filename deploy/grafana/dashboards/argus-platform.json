@@ -1,0 +1,138 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "上报吞吐（events/s）",
+      "description": "入库成功 vs 被限流拒绝。两条线一起看才有意义：入库归零而拒绝很高 = 全被限流挡了。",
+      "datasource": { "type": "prometheus", "uid": "argus-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(argus_ingest_events_total[$__rate_interval]))",
+          "legendFormat": "入库成功",
+          "datasource": { "type": "prometheus", "uid": "argus-prometheus" }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(argus_ingest_rejected_total[$__rate_interval]))",
+          "legendFormat": "被拒（限流等）",
+          "datasource": { "type": "prometheus", "uid": "argus-prometheus" }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "队列积压（每条线一个项目 · waiting）",
+      "description": "每个启用项目恒定有一条线（没积压就是 0）。线断了说明项目被停用或抓取失败，不是“项目没了”。",
+      "datasource": { "type": "prometheus", "uid": "argus-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (project_id) (argus_queue_jobs{state=\"waiting\"})",
+          "legendFormat": "{{project_id}}",
+          "datasource": { "type": "prometheus", "uid": "argus-prometheus" }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "归并处理速率（job 尝试次数/s）",
+      "description": "succeeded 是处理完的 job 数；failed 是每一次失败的尝试（一个重试 3 次的 job 贡献 3 次 failed）。和左上角的入库 QPS 对比，能立刻看出消费是否跟得上。",
+      "datasource": { "type": "prometheus", "uid": "argus-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(argus_job_attempts_total{result=\"succeeded\"}[$__rate_interval]))",
+          "legendFormat": "成功",
+          "datasource": { "type": "prometheus", "uid": "argus-prometheus" }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(argus_job_attempts_total{result=\"failed\"}[$__rate_interval]))",
+          "legendFormat": "失败（含重试）",
+          "datasource": { "type": "prometheus", "uid": "argus-prometheus" }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "死信队列增量（DLQ，应长期为 0）",
+      "description": "只要这条线离开 0，就说明有事件重试 3 次仍失败、数据正在丢。指标序列在第一次进 DLQ 之前不存在 —— 图上是空白而不是 0，这是健康状态。",
+      "datasource": { "type": "prometheus", "uid": "argus-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 30, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(argus_dlq_jobs_total[$__rate_interval]))",
+          "legendFormat": "新增死信",
+          "datasource": { "type": "prometheus", "uid": "argus-prometheus" }
+        }
+      ]
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["argus", "自监控"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "Argus · 平台自监控",
+  "uid": "argus-platform",
+  "version": 1
+}

@@ -1,0 +1,70 @@
+# 平台自监控告警规则（M6-8）
+#
+# ⚠️ 这些规则**监控的是 Argus 平台自己**，不是用户项目里的错误。
+# 用户项目告警由应用层的 alerts 模块负责（alert_rules 表 + 每分钟评估 + webhook 推送）。
+# 两套东西互不相干，别搞混：
+#   · alerts 模块    → "客户的项目在报错" → 推飞书
+#   · 本文件          → "Argus 自己快扛不住了/没人上报了" → Prometheus UI 亮红灯
+#
+# ⚠️ 现在没有 Alertmanager，所以这些规则**只会在 Prometheus 的 /alerts 页面显示
+# FIRING，不会推送任何消息**。"能看见"≠"会通知"。
+groups:
+  - name: argus-platform
+    rules:
+      # ① 积压：所有项目的 waiting 加起来超过 1000，且持续 5 分钟
+      #
+      # 为什么 `for: 5m`：worker 重启的那几秒积压会瞬间冲高，没有 for 的话
+      # 每次部署都报一次警 → 告警风暴 → 最后没人看告警了。
+      # 为什么不按项目判断：单个项目 100 条可能只是它自己忙；
+      # 全平台 1000 条才是"消费能力跟不上上报能力"的信号。
+      - alert: QueueBacklog
+        expr: sum(argus_queue_jobs{state="waiting"}) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: platform
+        annotations:
+          summary: 队列积压超过 1000（持续 5 分钟）
+          description: >-
+            所有项目 waiting 合计 {{ $value }} 条，消费速度跟不上上报速度。
+            先看 worker 是否存活、per-project 队列数是否异常。
+
+      # ② 死信：最近 5 分钟有 job 进了 DLQ
+      #
+      # 刻意**不加 for**：DLQ 只要涨，就说明有事件重试 3 次仍失败、数据正在丢。
+      # 这种事不需要"再观察 5 分钟确认"，等确认完损失已经发生了。
+      #
+      # ⚠️ 指标不存在时（从未进过 DLQ）increase() 返回空 → 规则不触发，
+      # 这正是健康状态。反过来说：如果指标链路本身挂了，这条也不会响。
+      - alert: DlqNotEmpty
+        expr: increase(argus_dlq_jobs_total[5m]) > 0
+        labels:
+          severity: critical
+          component: platform
+        annotations:
+          summary: 最近 5 分钟有 job 进入死信队列
+          description: >-
+            新增 {{ $value }} 条 job 转入 DLQ，说明有事件重试耗尽仍失败。
+            去 Redis 看 error-events-dlq，或查 worker 日志里的失败原因。
+
+      # ③ 停摆：连续 10 分钟没有任何成功入库的上报
+      #
+      # 这条抓的是"不是报错，而是死寂"：公钥配错（全 401）、接口 500、
+      # Redis 挂了导致入队失败 —— 这些都不会让错误率上升，只会让上报量归零。
+      #
+      # ⚠️ 已知误报场景：网站真的没人访问（周末、凌晨）。要消除它得结合
+      # 历史同期流量做同比，属于后续优化；现在只要在 README 里写明即可。
+      #
+      # 用 sum() 包一层 = "平台整体有没有上报"，而不是逐个项目判断
+      # （不加 sum 的话，9 个项目会各自报一次，等于 9 条重复告警）。
+      - alert: IngestStalled
+        expr: sum(rate(argus_ingest_events_total[5m])) == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: platform
+        annotations:
+          summary: 连续 10 分钟没有成功入库的上报
+          description: >-
+            上报链路可能已中断：检查 SDK 公钥、接入层 5xx、Redis 是否可用。
+            若确认是低流量时段，可忽略本次告警。

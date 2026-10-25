@@ -1,13 +1,23 @@
-# Argus 本地开发环境：PostgreSQL + Redis
+# Argus 本地开发环境：PostgreSQL + Redis + Prometheus + Grafana
 #
-# 在项目根目录执行：
-#   docker compose up -d            拉起两个服务（已存在则复用，数据不动）
+# 在 backend 目录执行：
+#   docker compose up -d            拉起依赖服务（已存在则复用，数据不动）
+#   docker compose up -d prometheus grafana   只起自监控那两个
 #   docker compose ps               看状态
 #   docker compose logs -f postgres 看日志
 #   docker compose down             收工 —— 不要加 -v，加了会连数据卷一起删
 #
-# 数据存放：PostgreSQL 的数据在具名卷 argus-pg-data 里，容器删了它还在，
-# 只有 docker compose down -v / docker volume rm 才会真正删除。
+# 端口一览：
+#   5432  PostgreSQL
+#   6379  Redis
+#   9090  Prometheus（指标抓取与告警规则）
+#   3001  Grafana（admin / argus-grafana-2026）
+#
+# ⚠️ api / worker **不在**这里 —— 它们用 npm run dev 跑在本机 node 上。
+# 所以 deploy/prometheus/prometheus.yml 里的 target 是 host.docker.internal。
+#
+# 数据存放：PostgreSQL 的数据在具名卷 argus-pg-data 里，Prometheus 的在
+# argus-prometheus-data 里；容器删了它们还在，只有 down -v 才会真正删除。
 
 # 项目名显式钉死为 argus。
 # 历史原因：本目录原名是中文（终极项目），Compose 取目录名做项目名时会被规整成
@@ -33,9 +43,61 @@ services:
     # 若要做到重启不丢任务，再加具名卷并开启 AOF 持久化。
     ports: ["6379:6379"]
 
+  # ── 平台自监控（M6-8）──────────────────────────────────────────────────
+  # 只把"第三方软件"放进容器；api / worker 仍跑在本机的 node（npm run dev），
+  # 所以 Prometheus 通过 host.docker.internal 访问它们 —— 容器里的 localhost
+  # 是容器自己。等 M7 做一键全栈时 api/worker 也进容器，target 改成服务名即可。
+  prometheus:
+    # 钉版本：latest 哪天变了存储格式或配置项，排查成本远高于升级收益
+    image: prom/prometheus:v2.55.1
+    ports: ["9090:9090"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      # 指标历史落在这里：容器重建不丢。保留 15 天（见 command）
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    # Windows / macOS 的 Docker Desktop 自带 host.docker.internal；
+    # Linux 必须显式映射这一行，否则容器里解析不到"宿主机"
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    # 宿主机 3001 → 容器 3000（3000 已被 API 占用）
+    ports: ["3001:3000"]
+    depends_on:
+      - prometheus
+    environment:
+      # 开发凭据，与 backend/.env 的 ADMIN_* 一样只用于本机
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: argus-grafana-2026
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      # 关掉匿名统计与更新检查：离线环境启动更快，也不往外发数据
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+    volumes:
+      # 数据源 + 面板全部 provisioning 自动配置 ——
+      # "docker compose up 就能看到图"，不需要在界面上手点一遍
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
 volumes:
   pg-data:
     # 把真实卷名钉死。不写这一行的话，卷名会是「项目名_pg-data」（即 argus_pg-data），
     # 一旦改了项目目录名 / 项目名，Docker 就会建一个全新的空卷 —— 看起来像数据丢了。
     # 注意：卷名一直是 argus-pg-data，目录从「终极项目」改成 Argus 不影响已有数据。
     name: argus-pg-data
+
+  # 指标历史：容器重建/重启都不丢，只有 docker compose down -v 才会清
+  prometheus-data:
+    name: argus-prometheus-data
+
+  # Grafana 自己的库（用户、偏好、面板编辑历史）。面板本身来自 provisioning，
+  # 所以这个卷丢了也不影响"面板还能不能导入"
+  grafana-data:
+    name: argus-grafana-data
