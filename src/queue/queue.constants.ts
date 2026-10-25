@@ -60,6 +60,15 @@ export const ERROR_EVENT_JOB = 'error-event';
  */
 export interface ErrorEventJobData {
   eventId: string;
+  /**
+   * 产生这条 job 的 HTTP 请求 id（M6-6）。
+   *
+   * 一次上报的生命周期横跨两个进程：API 收下并入队，worker 取出归并。
+   * 没有这个字段时，"这条事件为什么没归并"只能靠时间戳在两个终端里对猜。
+   *
+   * 可空：脚本 / 补扫任务直接入队时没有 HTTP 上下文。
+   */
+  requestId?: string;
 }
 
 /** 死信载荷：原载荷 + 失败现场，够事后定位就行 */

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ProjectScopeGuard } from '../auth/project-scope.guard';
 import { TenantPageQueryDto } from '../common/dto/tenant-query.dto';
@@ -40,8 +40,11 @@ export class PerformanceController {
   async store(
     @Body() body: IngestPerfDto,
     @IngestProject() project: IngestContext,
+    // 同 POST /error：pino-http 在请求对象上挂了 `id`（M6-6）。
+    // 性能上报目前不入队，所以这串 id 只用于把这条上报的日志和访问日志对齐
+    @Req() req: { id?: string },
   ): Promise<IngestPerfResult> {
-    return this.service.ingest(body, project.projectId);
+    return this.service.ingest(body, project.projectId, req.id);
   }
 
   /**

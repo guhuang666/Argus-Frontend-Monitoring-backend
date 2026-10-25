@@ -1,10 +1,18 @@
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { Logger as PinoLogger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { PrismaService } from './prisma/prisma.service';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // bufferLogs: true —— 容器初始化阶段 Nest 就会打日志（模块加载、路由映射），
+  // 那时 pino 还没就绪。不缓冲的话这批启动日志会直接丢失，
+  // 而出问题时最需要的恰恰是启动日志。
+  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+
+  // 把 Nest 内置 Logger 接到 pino 上 —— 之后所有 `new Logger(X.name)`
+  // 的输出都变成结构化 JSON，业务代码一行都不用改。
+  app.useLogger(app.get(PinoLogger));
 
   // 全局校验：DTO 上的 class-validator 装饰器靠它生效。
   // whitelist 会剥掉 DTO 未声明的字段，让入库数据形状可控。

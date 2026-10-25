@@ -3,9 +3,11 @@ import { Logger, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import type { Queue } from 'bullmq';
+import { Logger as PinoLogger } from 'nestjs-pino';
 import { EvaluationModule } from './alerts/evaluation.module';
 import { GroupingModule } from './grouping/grouping.module';
 import { ProjectWorkerManager } from './grouping/project-worker.manager';
+import { LoggingModule } from './logging/logging.module';
 import { WorkerMetricsModule } from './metrics/worker-metrics.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { PrismaService } from './prisma/prisma.service';
@@ -41,6 +43,8 @@ const REDIS_READY_TIMEOUT_MS = 10_000;
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    // 结构化日志（M6-6）：与 API 侧共用同一个模块，格式才不会漂移
+    LoggingModule,
     PrismaModule,
     QueueModule,
     // GroupingModule 带来 ErrorEventProcessor —— 也就是"消费"这件事本身。
@@ -57,7 +61,13 @@ const REDIS_READY_TIMEOUT_MS = 10_000;
 class WorkerModule {}
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.createApplicationContext(WorkerModule);
+  // bufferLogs: 容器初始化阶段的日志先缓冲，等 pino 就绪再一起输出（同 main.ts）
+  const app = await NestFactory.createApplicationContext(WorkerModule, {
+    bufferLogs: true,
+  });
+  // 让 worker 的日志与 API 走同一套 JSON 格式：两个进程的日志常常是唯一的证据，
+  // 格式不一致就没法用同一套查询去搜
+  app.useLogger(app.get(PinoLogger));
 
   // SIGINT / SIGTERM → 触发 onModuleDestroy：Prisma 断连、BullMQ 优雅关闭
   // （正在处理的 job 会先跑完再退，不会做到一半被砍）

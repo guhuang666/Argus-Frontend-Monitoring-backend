@@ -127,12 +127,12 @@ export class ErrorEventProcessor {
    * 不要自己吞掉错误假装成功 —— 吞掉等于永久丢失这条事件的归并。
    */
   async handle(job: Job<ErrorEventJobData>): Promise<void> {
-    const { eventId } = job.data;
+    const { eventId, requestId } = job.data;
     const outcome = await this.claim(eventId);
 
     if (outcome === null) {
       // 声明失败有两种可能，分开记：区分"重复投递"和"job 指向了不存在的事件"
-      await this.explainUnclaimed(eventId);
+      await this.explainUnclaimed(eventId, requestId);
       return;
     }
 
@@ -140,8 +140,13 @@ export class ErrorEventProcessor {
     // 日志带上 group / fingerprint / times：验收时不用查库就能看出
     // 两条上报有没有落进同一个问题里。
     // sym=v2/raw=v1 同理：符号化有没有生效，一条日志就能判断
+    //
+    // requestId（M6-6）：API 侧那次 HTTP 请求的 id，由 job.data 带进来。
+    // 用同一个值 grep 两个进程的日志，就能把「上报」和「归并」拼成一条链路。
+    // 老 job（M6-6 之前投递的）没有这个字段 → 打 `-`，不影响任何逻辑。
     this.logger.log(
-      `已消费 event_id=${eventId} group=${groupId.slice(0, 8)} ` +
+      `已消费 event_id=${eventId} requestId=${requestId ?? '-'} ` +
+        `group=${groupId.slice(0, 8)} ` +
         `fp=${fingerprint.slice(0, 8)} times=${timesSeen} ` +
         `ver=${symbolicated ? 'v2' : 'v1'} ` +
         `mechanism=${event.mechanism} type=${event.type} ` +
@@ -381,19 +386,25 @@ export class ErrorEventProcessor {
   }
 
   /** 没抢到声明时，查清楚是哪一种情况再记日志（重复投递是正常现象，不该刷 error） */
-  private async explainUnclaimed(eventId: string): Promise<void> {
+  private async explainUnclaimed(
+    eventId: string,
+    requestId?: string,
+  ): Promise<void> {
     const row = await this.prisma.errorEvent.findUnique({
       where: { eventId },
       select: { processedAt: true },
     });
 
     if (row === null) {
-      this.logger.warn(`事件不存在，跳过: event_id=${eventId}`);
+      this.logger.warn(
+        `事件不存在，跳过: event_id=${eventId} requestId=${requestId ?? '-'}`,
+      );
       return;
     }
 
     this.logger.debug(
-      `已处理过，跳过: event_id=${eventId} processed_at=${row.processedAt?.toISOString() ?? '?'}`,
+      `已处理过，跳过: event_id=${eventId} requestId=${requestId ?? '-'} ` +
+        `processed_at=${row.processedAt?.toISOString() ?? '?'}`,
     );
   }
 
@@ -415,11 +426,15 @@ export class ErrorEventProcessor {
 
     const attempts = job.opts.attempts ?? 1;
     const eventId = job.data.eventId;
+    // requestId 跟着 job 一起进来，这里必须**接着往下传**（进 DLQ 载荷 + 日志）：
+    // 一条事件最终进了死信，几乎是最需要回溯"它当初是从哪次请求来的"的场景
+    const requestId = job.data.requestId;
 
     // 还有重试次数：只 warn。这是正常路径，不是故障
     if (job.attemptsMade < attempts) {
       this.logger.warn(
-        `第 ${job.attemptsMade}/${attempts} 次失败，将重试: event_id=${eventId} 原因=${err.message}`,
+        `第 ${job.attemptsMade}/${attempts} 次失败，将重试: event_id=${eventId} ` +
+          `requestId=${requestId ?? '-'} 原因=${err.message}`,
       );
       return;
     }
@@ -427,6 +442,7 @@ export class ErrorEventProcessor {
     // 重试耗尽 → 转 DLQ
     const payload: ErrorEventDlqData = {
       eventId,
+      requestId,
       failedReason: err.message,
       attemptsMade: job.attemptsMade,
       failedAt: new Date().toISOString(),
@@ -445,13 +461,15 @@ export class ErrorEventProcessor {
       // 但它并没有"进入死信队列"——把失败记成成功会让这个指标骗人
       this.metrics.recordDlq(projectIdOf(job.queueName));
       this.logger.error(
-        `重试 ${job.attemptsMade} 次仍失败，已转入 DLQ: event_id=${eventId} 原因=${err.message}`,
+        `重试 ${job.attemptsMade} 次仍失败，已转入 DLQ: event_id=${eventId} ` +
+          `requestId=${requestId ?? '-'} 原因=${err.message}`,
       );
     } catch (dlqErr) {
       // DLQ 也写不进去（通常是 Redis 也挂了）：这时失败现场就只剩这一行日志，
       // 必须用 error 级别打出来，别让它悄悄消失
       this.logger.error(
         `转入 DLQ 失败，失败现场仅存于本行日志: event_id=${eventId} ` +
+          `requestId=${requestId ?? '-'} ` +
           `原始原因=${err.message} DLQ 错误=${String(dlqErr)}`,
       );
     }

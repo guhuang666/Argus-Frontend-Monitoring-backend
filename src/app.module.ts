@@ -6,6 +6,7 @@ import { ErrorEventsModule } from './error-events/error-events.module';
 import { HealthModule } from './health/health.module';
 import { IssuesModule } from './issues/issues.module';
 import { KeysModule } from './keys/keys.module';
+import { LoggingModule } from './logging/logging.module';
 import { MetricsModule } from './metrics/metrics.module';
 import { PerformanceModule } from './performance/performance.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -17,6 +18,9 @@ import { StatsModule } from './stats/stats.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    // 结构化日志（M6-6）。放最前面：后面的模块在初始化阶段打的日志
+    // 也要走同一套格式（配合 main.ts 的 bufferLogs）
+    LoggingModule,
     // PostgreSQL 数据访问层。
     // 注：Mongoose 暂时保留 —— error-events / performance 两个模块还在用它，
     // 等 Prisma 侧跑通、业务代码迁完再整体摘除，避免一次改两件事。

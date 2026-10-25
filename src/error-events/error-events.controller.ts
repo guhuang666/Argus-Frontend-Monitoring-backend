@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ProjectScopeGuard } from '../auth/project-scope.guard';
 import { TenantPageQueryDto } from '../common/dto/tenant-query.dto';
@@ -46,8 +46,11 @@ export class ErrorEventsController {
   async store(
     @Body() body: IngestErrorDto,
     @IngestProject() project: IngestContext,
+    // pino-http 在这个请求对象上挂了 `id`（main.ts 里 useLogger 之后就生效）。
+    // 显式往 service 传，而不是用隐式上下文 —— 新手能一眼看出它从哪来。
+    @Req() req: { id?: string },
   ): Promise<IngestResult> {
-    return this.service.ingest(body, project.projectId);
+    return this.service.ingest(body, project.projectId, req.id);
   }
 
   /**

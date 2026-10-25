@@ -33,8 +33,11 @@ export class PerformanceService {
    *
    * 注意：DTO 里没声明的字段已经被 ValidationPipe 的 whitelist 剥掉了，
    * 所以这里看不到"客户端多发的垃圾字段" —— 那属于被丢弃的数据，不是收到的数据。
+   *
+   * M6-6 起改成 debug：理由与 ErrorEventsService.logIncoming 完全相同 ——
+   * 全量 payload 是排查用的，不是日常流量记录。默认 info 级别下不输出。
    */
-  private logIncoming(payload: IngestPerfDto): void {
+  private logIncoming(payload: IngestPerfDto, requestId?: string): void {
     let pretty: string;
     try {
       pretty = JSON.stringify(payload, null, 2);
@@ -44,7 +47,9 @@ export class PerformanceService {
       return;
     }
 
-    this.logger.log(['', `收到性能事件（JSON ${pretty.length} 字符）`, '---', pretty, '---'].join('\n'));
+    this.logger.debug(
+      ['', `[${requestId ?? '-'}] 收到性能事件（JSON ${pretty.length} 字符）`, '---', pretty, '---'].join('\n'),
+    );
   }
 
   /**
@@ -58,9 +63,18 @@ export class PerformanceService {
    *
    * 为什么不用 upsert：它对重复投递是静默更新，接口就没法再回 duplicate 了。
    * 为什么不用先 findUnique 再 create：两次查询之间有竞态，并发重复上报两个都会走到 create。
+   *
+   * ── requestId（M6-6）──────────────────────────────────────────────────
+   * 性能上报**不入队**（没有归并逻辑要跑），所以这串 id 只在本次进程内用：
+   * 把 debug 级的 payload 日志和 pino-http 的访问日志对上同一行。
+   * 允许 undefined —— 没有它只是日志少一个字段，不能因此改变任何行为。
    */
-  async ingest(payload: IngestPerfDto, projectId: string): Promise<IngestPerfResult> {
-    this.logIncoming(payload);
+  async ingest(
+    payload: IngestPerfDto,
+    projectId: string,
+    requestId?: string,
+  ): Promise<IngestPerfResult> {
+    this.logIncoming(payload, requestId);
 
     try {
       await this.prisma.performanceMetric.create({ data: this.toRow(payload, projectId) });

@@ -46,8 +46,15 @@ export class ErrorEventsService {
    *
    * 注意：DTO 里没声明的字段已经被 ValidationPipe 的 whitelist 剥掉了，
    * 所以这里看不到"客户端多发的垃圾字段" —— 那属于被丢弃的数据，不是收到的数据。
+   *
+   * ── M6-6 起改成 debug ──────────────────────────────────────────────────
+   * 这条日志一条几 KB、每条上报都打，属于**排查时**才需要的东西，不是日常流量记录。
+   * 留在 info 会让"一条上报一行摘要"这条主日志被淹没，日志量也直接翻好几倍。
+   * 默认 `LOG_LEVEL=info` 下它不输出；要抓原始 payload：
+   *   LOG_LEVEL=debug npm run dev
+   * 之后用 requestId 前缀把同一次请求的几行日志串起来（见 main.ts 的 LoggingModule）。
    */
-  private logIncoming(payload: IngestErrorDto): void {
+  private logIncoming(payload: IngestErrorDto, requestId?: string): void {
     let pretty: string;
     try {
       pretty = JSON.stringify(payload, null, 2);
@@ -57,7 +64,9 @@ export class ErrorEventsService {
       return;
     }
 
-    this.logger.log(['', `收到异常事件（JSON ${pretty.length} 字符）`, '---', pretty, '---'].join('\n'));
+    this.logger.debug(
+      ['', `[${requestId ?? '-'}] 收到异常事件（JSON ${pretty.length} 字符）`, '---', pretty, '---'].join('\n'),
+    );
   }
 
   /**
@@ -74,9 +83,19 @@ export class ErrorEventsService {
    * 两步之间刻意不做跨系统事务（Redis 与 PG 之间没有可靠的两阶段提交，硬凑出来的
    * "事务"只会在其中一边挂着时留下更难查的状态）。代价是"入库成功但入队失败"，
    * 由补扫任务兜住。
+   *
+   * ── requestId（M6-6）──────────────────────────────────────────────────
+   * 参数来自控制器从 `req.id` 取的请求 id（pino-http 生成或继承 x-request-id）。
+   * 它的唯一用途是**跟着 job 进队列**，让 Worker 那行"已消费"日志能和
+   * "这条上报来自哪次 HTTP 请求"对上 —— 跨进程排查一条事件时靠它串起来。
+   * 允许为 undefined：老客户端/老 job 没有它，日志里打 `-` 即可，不能因此报错。
    */
-  async ingest(payload: IngestErrorDto, projectId: string): Promise<IngestResult> {
-    this.logIncoming(payload);
+  async ingest(
+    payload: IngestErrorDto,
+    projectId: string,
+    requestId?: string,
+  ): Promise<IngestResult> {
+    this.logIncoming(payload, requestId);
 
     try {
       await this.prisma.errorEvent.create({ data: this.toRow(payload, projectId) });
@@ -111,7 +130,7 @@ export class ErrorEventsService {
       hasError: true,
     });
 
-    await this.enqueue(payload.event_id, projectId);
+    await this.enqueue(payload.event_id, projectId, requestId);
 
     return { event_id: payload.event_id, duplicate: false };
   }
@@ -133,19 +152,29 @@ export class ErrorEventsService {
    * ── 只有新事件才入队 ───────────────────────────────────────────────────
    * duplicate 分支不入队：这条事件上一次已经入过队（jobId 相同，去重窗口内会被
    * 静默忽略），真要是上次入队失败，补扫会按 processed_at IS NULL 把它捞回来。
+   *
+   * ── requestId 进 job.data ──────────────────────────────────────────────
+   * job.data 里本来就只带主键（见 queue.constants 的"只带主键"约定），
+   * requestId 是**唯一**的例外：它不是业务数据、不落库、只出现在日志里，
+   * 但它是跨进程串联的唯一线索，丢了就再也补不回来（Worker 拿不到 HTTP 上下文）。
+   * 值为 undefined 时按 BullMQ 的行为会被序列化丢掉，Worker 侧按"没有"处理。
    */
-  private async enqueue(eventId: string, projectId: string): Promise<void> {
+  private async enqueue(
+    eventId: string,
+    projectId: string,
+    requestId?: string,
+  ): Promise<void> {
     try {
       // S7：投到**这个项目的**队列，而不是全局那条
       await this.queues.queueFor(projectId).add(
         ERROR_EVENT_JOB,
-        { eventId },
+        { eventId, requestId },
         { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(eventId) },
       );
     } catch (err) {
       this.logger.error(
         `入队失败，事件已入库但尚未归并（等补扫兜住）: event_id=${eventId} ` +
-          `project=${projectId} 原因=${String(err)}`,
+          `project=${projectId} requestId=${requestId ?? '-'} 原因=${String(err)}`,
       );
     }
   }
