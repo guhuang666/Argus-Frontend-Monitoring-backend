@@ -1,0 +1,89 @@
+name: ci
+
+# 只在 master 的推送和所有 PR 上跑。
+# 不做 tag / 定时任务：这个阶段的目标是"别把坏代码合进去"，不是发布流水线。
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# 工作流默认权限是读写；CI 只需要读代码。
+permissions:
+  contents: read
+
+jobs:
+  build-and-unit:
+    runs-on: ubuntu-latest
+    # 防止某一步卡死把 job 拖到 6 小时上限（Actions 默认的硬超时）
+    timeout-minutes: 20
+
+    env:
+      # ── 为什么给假值 ──────────────────────────────────────────────────
+      # 这两项不是秘密，只是为了让配置能读出来：
+      #   · prisma.config.ts: datasource.url = env("DATABASE_URL")
+      #     缺少它会在【加载配置】阶段就抛错，连 prisma generate 都跑不了
+      #   · JWT_SECRET：鉴权模块 fail-closed，没有它 API 起不来
+      # 真正的秘密永远不进仓库；CI 不需要连生产。
+      DATABASE_URL: postgresql://argus:argus@127.0.0.1:5432/argus?schema=public
+      JWT_SECRET: ci-only-secret-0123456789abcdef0123456789
+
+    # e2e 需要真 PG 和真 Redis（归并链路会往 BullMQ 投递任务）。
+    # 单元测试不需要它们，但放在同一个 job 里能少起一次容器。
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: argus
+          POSTGRES_PASSWORD: argus
+          POSTGRES_DB: argus
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # 缓存 npm 下载。需要 package-lock.json —— 本仓库有
+          cache: npm
+
+      # 用 ci 而不是 install：严格按 lock 文件装，装出来的版本可复现
+      - run: npm ci
+
+      # ⚠️ 这一步不能省。
+      # backend/.gitignore 里有 /generated/（Prisma 生成的客户端），
+      # 新 clone 的仓库里没有它 —— 少了这一步，紧接着的 build 会报
+      #   error TS2307: Cannot find module '../../generated/prisma/client'
+      # 这是新 clone 最常踩的第一个坑，也是 CI 最先帮你抓到的东西。
+      - run: npx prisma generate
+
+      - run: npm run build
+      - run: npm test
+
+      # ── e2e ────────────────────────────────────────────────────────────
+      # e2e 跑在【同一个 PG 实例的另一个 schema】上（?schema=e2e），
+      # 不是另一个数据库。好处：本地和 CI 都不用额外起服务。
+      #
+      # 这里必须显式覆盖 DATABASE_URL：job 级的是 ?schema=public，
+      # 而迁移必须建在 e2e schema 里，否则测试会报 "relation does not exist"。
+      # （test/e2e-setup.ts 里也把 DATABASE_URL 指向 e2e schema，
+      #   两处必须是同一个值 —— 它是"建表"和"连表"的对齐点。）
+      - name: 建 e2e schema（跑迁移）
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://argus:argus@127.0.0.1:5432/argus?schema=e2e
+
+      - name: e2e 测试
+        run: npm run test:e2e
+        env:
+          # e2e-setup.ts 优先读 E2E_DATABASE_URL，再退回内置默认值。
+          # 显式传一遍，是为了"改默认值时 CI 不会悄悄连到别处"。
+          E2E_DATABASE_URL: postgresql://argus:argus@127.0.0.1:5432/argus?schema=e2e
