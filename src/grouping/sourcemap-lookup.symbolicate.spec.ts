@@ -92,12 +92,7 @@ describe('SourcemapLookupService.symbolicate', () => {
     } as unknown as Prisma.TransactionClient;
 
     const service = new SourcemapLookupService({} as unknown as PrismaService);
-    const result = await service.symbolicate(
-      db,
-      'proj-1',
-      'web@1.0.0',
-      FRAMES,
-    );
+    const result = await service.symbolicate(db, 'proj-1', 'web@1.0.0', FRAMES);
 
     expect(result.frames[0]).toMatchObject({
       // 压缩位置原样保留（界面要并排显示）

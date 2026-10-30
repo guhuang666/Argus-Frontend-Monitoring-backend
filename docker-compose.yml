@@ -1,23 +1,27 @@
-# Argus 本地开发环境：PostgreSQL + Redis + Prometheus + Grafana
+# Argus 本地环境：PostgreSQL + Redis + api + worker + Prometheus + Grafana
 #
 # 在 backend 目录执行：
-#   docker compose up -d            拉起依赖服务（已存在则复用，数据不动）
-#   docker compose up -d prometheus grafana   只起自监控那两个
-#   docker compose ps               看状态
-#   docker compose logs -f postgres 看日志
-#   docker compose down             收工 —— 不要加 -v，加了会连数据卷一起删
+#   docker compose up -d                    拉起全部（含 api / worker 容器）
+#   docker compose up -d postgres redis     只起依赖（本机 npm run dev 时用）
+#   docker compose ps                       看状态
+#   docker compose logs -f api              看某个服务的日志
+#   docker compose down                     收工 —— 不要加 -v，加了会连数据卷一起删
 #
 # 端口一览：
+#   3000  api（容器）
 #   5432  PostgreSQL
 #   6379  Redis
 #   9090  Prometheus（指标抓取与告警规则）
 #   3001  Grafana（admin / argus-grafana-2026）
 #
-# ⚠️ api / worker **不在**这里 —— 它们用 npm run dev 跑在本机 node 上。
-# 所以 deploy/prometheus/prometheus.yml 里的 target 是 host.docker.internal。
+# 两种开发方式并存：
+#   · 容器化（M7-T6）：docker compose up -d api worker
+#   · 本机 node（更快、能断点）：docker compose up -d postgres redis，然后 npm run dev
+# ⚠️ 两者都占 3000 端口，不要同时开。
 #
 # 数据存放：PostgreSQL 的数据在具名卷 argus-pg-data 里，Prometheus 的在
 # argus-prometheus-data 里；容器删了它们还在，只有 down -v 才会真正删除。
+# sourcemap 落盘在 argus-uploads 卷里，api 与 worker 共用。
 
 # 项目名显式钉死为 argus。
 # 历史原因：本目录原名是中文（终极项目），Compose 取目录名做项目名时会被规整成
@@ -36,6 +40,13 @@ services:
       POSTGRES_PASSWORD: argus
     ports: ["5432:5432"]
     volumes: ["pg-data:/var/lib/postgresql/data"]
+    # api / worker 用 depends_on 的 service_healthy 等它就绪。
+    # 少了这条 healthcheck，compose 会直接报 "dependency has no healthcheck"。
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U argus -d argus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   redis:
     image: redis:7-alpine
@@ -43,10 +54,82 @@ services:
     # 若要做到重启不丢任务，再加具名卷并开启 AOF 持久化。
     ports: ["6379:6379"]
 
+  # ── 应用进程（M7-T6 一键全栈）──────────────────────────────────────────
+  # 一次性任务容器：跑 `prisma migrate deploy && node scripts/seed.cjs`。
+  # 跑完退出（exited 0），api / worker 才启动 —— 迁移失败就别带病上线。
+  # 它用的是 Dockerfile 的 migrate 阶段（保留 devDeps，含 prisma CLI），
+  # 不进最终交付镜像。
+  migrate:
+    build:
+      context: .
+      target: migrate
+    environment:
+      DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=public
+      # seed.cjs 用这两个建管理员账号；不传就用脚本里的默认值
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@argus.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-argus-admin-2026}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # api 与 worker 共用同一个镜像（同一个 Dockerfile），只靠 command 区分入口。
+  # 容器网络里互相访问用服务名 postgres / redis —— 不是 127.0.0.1。
+  api:
+    build: .
+    image: argus-backend
+    environment:
+      DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=public
+      REDIS_HOST: redis
+      # 从 backend/.env 读：compose 会自动加载同目录的 .env 做变量替换
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: "3000"
+    ports: ["3000:3000"]
+    volumes:
+      # sourcemap 落盘要放在容器可写层之外，否则重建容器就丢
+      - uploads:/app/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker:
+    build: .
+    image: argus-backend
+    # 同一个镜像，换入口：worker 只消费队列，没有 HTTP 端口
+    command: ["node", "dist/src/worker.js"]
+    environment:
+      DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=public
+      REDIS_HOST: redis
+      JWT_SECRET: ${JWT_SECRET}
+    volumes:
+      # 必须和 api 共用同一个卷：worker 要读 api 上传的 .map
+      - uploads:/app/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # ── 前端（M7-T6）───────────────────────────────────────────────────────
+  # dashboard 编译成静态文件后由 nginx 提供，并把 /api/ 反代到 api 容器。
+  # 只声明 image，不写 build：镜像由手动构建产出，与后端保持同一种工作方式。
+  #   docker build -t argus-dashboard E:\Argus\dashboard
+  web:
+    image: argus-dashboard
+    # 宿主机 8080 → 容器 80（避开 api 占用的 3000）
+    ports: ["8080:80"]
+    depends_on:
+      - api
+
   # ── 平台自监控（M6-8）──────────────────────────────────────────────────
-  # 只把"第三方软件"放进容器；api / worker 仍跑在本机的 node（npm run dev），
-  # 所以 Prometheus 通过 host.docker.internal 访问它们 —— 容器里的 localhost
-  # 是容器自己。等 M7 做一键全栈时 api/worker 也进容器，target 改成服务名即可。
+  # Prometheus 的目标配置见 deploy/prometheus/prometheus.yml。
+  # 容器化之后 api / worker 也在同一网络里，target 可以从 host.docker.internal
+  # 改成服务名 api:3000（见该文件的下一步演进）。
   prometheus:
     # 钉版本：latest 哪天变了存储格式或配置项，排查成本远高于升级收益
     image: prom/prometheus:v2.55.1
@@ -92,6 +175,10 @@ volumes:
     # 一旦改了项目目录名 / 项目名，Docker 就会建一个全新的空卷 —— 看起来像数据丢了。
     # 注意：卷名一直是 argus-pg-data，目录从「终极项目」改成 Argus 不影响已有数据。
     name: argus-pg-data
+
+  # sourcemap 落盘目录。api 写、worker 读，重建容器不丢。
+  uploads:
+    name: argus-uploads
 
   # 指标历史：容器重建/重启都不丢，只有 docker compose down -v 才会清
   prometheus-data:

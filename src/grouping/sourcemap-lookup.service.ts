@@ -9,6 +9,15 @@ import type { Frame } from './fingerprint';
 import { symbolicateFrames } from './symbolicate';
 import type { SymbolicationResult } from './symbolicate';
 
+/** 空表：没有版本号 / 没有帧时用它，效果等同于"每一帧都查不到 map" */
+const EMPTY_MAP: ReadonlyMap<string, string> = new Map<string, string>();
+
+/** release → 产物路径表的缓存时长。短，是为了让刚上传的 map 尽快可见 */
+const RELEASE_CACHE_TTL_MS = 30_000;
+
+/** 最多缓存多少个 (project, release)。FIFO 淘汰，防止无界增长 */
+const MAX_CACHED_RELEASES = 32;
+
 /**
  * Sourcemap 查找服务（M3 / FR-3.4）—— 符号化里**唯一碰 I/O 的地方**。
  *
@@ -36,10 +45,10 @@ import type { SymbolicationResult } from './symbolicate';
 export class SourcemapLookupService {
   private readonly logger = new Logger(SourcemapLookupService.name);
 
-  /** release 版本号 → 该版本所有产物到 map 的映射。TTL 是为了让新上传的 map 能被看到 */
+  /** release 版本号 → 该版本所有产物到 map 路径的映射。TTL 是为了让新上传的 map 能被看到 */
   private readonly releaseCache = new Map<
     string,
-    { expiresAt: number; byArtifact: Map<string, string> }
+    { expiresAt: number; mapPathByArtifact: Map<string, string> }
   >();
 
   /** sourcemapPath（内容哈希命名）→ 已解析的 map。内容不可变，所以不需要过期 */
@@ -49,6 +58,10 @@ export class SourcemapLookupService {
 
   /**
    * 把一堆压缩帧还原成源码位置。
+   *
+   * 两步：**先把"产物路径 → map 文件"这张小表取来，再交给 symbolicateFrames**。
+   * 降级不在这里写分支 —— 查不到 map 就是表里没有那一项，
+   * 逐帧怎么处理是 symbolicateFrames 的事。
    *
    * @param db      事务客户端 —— 与声明事件共用同一条连接：
    *                在 $transaction 里另开连接池连接，并发高时会自己把自己卡住
@@ -61,24 +74,29 @@ export class SourcemapLookupService {
     release: string | null,
     frames: Frame[],
   ): Promise<SymbolicationResult> {
-    // 没有版本 / 没有帧（resource 通道）→ 不必查库，直接全量降级
-    if (release === null || frames.length === 0) {
-      return symbolicateFrames(frames, () => null);
-    }
+    // 没有版本号（SDK 没配）或没有帧（resource 通道）→ 不必查库。
+    // 用空表的效果和"查了但没查到"完全一样，所以下面只有一条路
+    const mapPathByArtifact =
+      release === null || frames.length === 0
+        ? EMPTY_MAP
+        : await this.mapPathsFor(db, projectId, release);
 
-    const byArtifact = await this.mapsFor(db, projectId, release);
-    if (byArtifact.size === 0) {
-      return symbolicateFrames(frames, () => null);
-    }
-
+    // 查表函数：产物路径 → 解析好的 map；返回 null 就代表这一帧还原不了。
+    // 两种情况都是 null，但原因不同：
+    //   · 这个产物从没上传过 map        → 这里直接返回 null
+    //   · 上传过但文件读不出来 / JSON 坏 → loadMap 内部返回 null
     return symbolicateFrames(frames, (artifactPath) => {
-      const relativePath = byArtifact.get(artifactPath);
-      return relativePath === undefined ? null : this.loadMap(relativePath);
+      const mapPath = mapPathByArtifact.get(artifactPath);
+      return mapPath === undefined ? null : this.loadMap(mapPath);
     });
   }
 
-  /** (project, release) → (artifact_path → sourcemap_path)。带 TTL 缓存，空结果也缓存 */
-  private async mapsFor(
+  /**
+   * (project, release) → (artifact_path → sourcemap_path)。带 TTL 缓存，空结果也缓存。
+   *
+   * 一次查两条表（release 找 id、sourcemap_files 列文件），之后整批帧都在这张小表里查。
+   */
+  private async mapPathsFor(
     db: Prisma.TransactionClient,
     projectId: string,
     release: string,
@@ -88,24 +106,24 @@ export class SourcemapLookupService {
     const cacheKey = `${projectId}:${release}`;
     const hit = this.releaseCache.get(cacheKey);
     if (hit !== undefined && hit.expiresAt > Date.now()) {
-      return hit.byArtifact;
+      return hit.mapPathByArtifact;
     }
 
-    const byArtifact = new Map<string, string>();
+    const mapPathByArtifact = new Map<string, string>();
 
     try {
-      const row = await db.release.findUnique({
+      const releaseRow = await db.release.findUnique({
         where: { projectId_version: { projectId, version: release } },
         select: { id: true },
       });
 
-      if (row !== null) {
+      if (releaseRow !== null) {
         const files = await db.sourcemapFile.findMany({
-          where: { releaseId: row.id },
+          where: { releaseId: releaseRow.id },
           select: { artifactPath: true, sourcemapPath: true },
         });
         for (const file of files) {
-          byArtifact.set(file.artifactPath, file.sourcemapPath);
+          mapPathByArtifact.set(file.artifactPath, file.sourcemapPath);
         }
       }
     } catch (err) {
@@ -116,7 +134,7 @@ export class SourcemapLookupService {
       return new Map();
     }
 
-    if (byArtifact.size === 0) {
+    if (mapPathByArtifact.size === 0) {
       // 缓存"这个版本还没有 map"，避免每条事件都查一遍库。
       // TTL 到期后重新查 —— 那时用户可能刚上传完
       this.logger.debug(
@@ -124,28 +142,20 @@ export class SourcemapLookupService {
       );
     }
 
-    this.rememberRelease(release, byArtifact);
-    return byArtifact;
-  }
-
-  private rememberRelease(
-    release: string,
-    byArtifact: Map<string, string>,
-  ): void {
-    const RELEASE_CACHE_TTL_MS = 30_000;
-    const MAX_CACHED_RELEASES = 32;
-
+    // ⚠️ 写缓存用 cacheKey（带 projectId），与上面读缓存的键必须一致。
+    // 只写 release 的话读不到 —— 每条事件都会重复查两次库
     if (this.releaseCache.size >= MAX_CACHED_RELEASES) {
       // 简单 FIFO 淘汰：Map 保持插入顺序，删最早那个。
       // 用展开而不是 keys().next().value —— 后者的类型在 type-aware lint 里是 any
       const oldest = [...this.releaseCache.keys()][0];
       if (oldest !== undefined) this.releaseCache.delete(oldest);
     }
-
-    this.releaseCache.set(release, {
+    this.releaseCache.set(cacheKey, {
       expiresAt: Date.now() + RELEASE_CACHE_TTL_MS,
-      byArtifact,
+      mapPathByArtifact,
     });
+
+    return mapPathByArtifact;
   }
 
   /** 读盘 + 解析一张 map。失败返回 null，永不抛 */

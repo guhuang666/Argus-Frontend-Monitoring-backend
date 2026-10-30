@@ -1,0 +1,25 @@
+# 构建上下文排除清单。
+#
+# 原则：这里列出的都是「镜像里能重新生成」，或者「绝不该进镜像」的东西。
+# 它们仍然存在于镜像里 —— npm ci 装依赖、prisma generate 造客户端、
+# npm run build 编译源码，运行时数据由 volume 挂进来。
+
+node_modules
+dist
+generated
+uploads
+uploads-e2e
+
+# ⚠️ 必排除：.env 里有 JWT_SECRET 和 ARGUS_SECRET，
+# 进了镜像就等于公开（镜像会被 push / pull / 复制）。
+# 运行时由 docker compose 的 environment 注入。
+.env
+.env.*
+
+*.log
+.git
+.vscode
+coverage
+
+# tsc 的增量编译缓存。带进上下文会让容器里的首次编译误判为「已是最新」
+*.tsbuildinfo
