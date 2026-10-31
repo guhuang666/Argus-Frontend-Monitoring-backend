@@ -2,6 +2,15 @@
 FROM node:22-slim AS build
 WORKDIR /app
 
+# Prisma 的查询引擎是动态库，链接系统的 libssl。node:22-slim 里没有 openssl，
+# 不装的话 Prisma 检测不到版本，会警告 "defaulting to openssl-1.1.x"。
+# 现在能跑是因为构建与运行时「猜成同一个版本」，换了基础镜像就可能加载失败。
+# 放在最前面：这一层只依赖基础镜像，缓存永远有效。
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 # 依赖层：只拷清单，改业务代码不用重装依赖（层缓存）
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -49,6 +58,14 @@ RUN npm prune --omit=dev
 FROM node:22-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+
+# 与 build 阶段同理：运行时要加载 libquery_engine-*.so.node，它链接 libssl。
+# 两个阶段的 openssl 版本必须一致，否则引擎加载会失败
+# （报错形如 Unable to require libquery_engine-debian-openssl-*.so.node）。
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
 
 # 来源是 prod-deps（已 prune），不是 build
 COPY --from=prod-deps --chown=node:node /app/node_modules ./node_modules

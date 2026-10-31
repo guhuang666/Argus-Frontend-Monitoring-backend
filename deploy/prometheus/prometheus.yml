@@ -1,16 +1,21 @@
-# Prometheus 抓取配置（M6-8）
+# Prometheus 抓取配置（M6-8；M7-T6 容器化后 target 改为服务名）
 #
 # ── 为什么是两个 target ────────────────────────────────────────────────
 # 指标住在**两个进程的内存里**，不是一份数据：
-#   :3000/metrics  = API 进程（上报量、限流丢弃、队列积压、HTTP 默认指标）
-#   :9464/metrics  = worker 进程（job 尝试次数、DLQ）
+#   api:3000/metrics    = API 进程（上报量、限流丢弃、队列积压、HTTP 默认指标）
+#   worker:9464/metrics = worker 进程（job 尝试次数、DLQ）
 # API 的 registry 里根本没有 job_attempts 这些序列，所以必须抓两次。
 # Prometheus 会给每个 target 自动打上 instance/job 标签，两条序列不会混。
 #
-# ── 为什么是 host.docker.internal ──────────────────────────────────────
-# Prometheus 跑在容器里，而 api / worker 是宿主机上的 node 进程。
-# 容器里的 localhost 是容器自己，`host.docker.internal` 才指向宿主机。
-# （api/worker 之后被容器化时，这里要改成服务名 `api:3000` / `worker:9464`）
+# ── 为什么是服务名，而不是 host.docker.internal ────────────────────────
+# api / worker 已经容器化（M7-T6），和 Prometheus 同在 compose 的默认网络里。
+# Docker 内置 DNS 会把 `api` / `worker` 解析成对应容器的内网 IP，
+# 所以直接用服务名 + 容器内端口即可。
+# 容器里的 localhost 是容器自己，绝不能写 127.0.0.1。
+#
+# 历史：容器化之前 api / worker 跑在宿主机的 node 上（npm run dev），
+# 那时这里写的是 host.docker.internal:3000 / :9464 —— 借这个特殊域名
+# 绕回宿主机。改成服务名之后，指标抓取不再依赖宿主机上跑着 node 进程。
 global:
   # 15 秒一次：与 Grafana 面板的 $__rate_interval 一起看是够用的精度。
   # 调太密（1s）会让 Redis 抓取开销上来：队列积压每次抓取要问 9 个项目各一次。
@@ -24,13 +29,13 @@ scrape_configs:
   - job_name: argus-api
     metrics_path: /metrics
     static_configs:
-      - targets: ['host.docker.internal:3000']
+      - targets: ['api:3000']
         labels:
           component: api
 
   - job_name: argus-worker
     metrics_path: /metrics
     static_configs:
-      - targets: ['host.docker.internal:9464']
+      - targets: ['worker:9464']
         labels:
           component: worker
