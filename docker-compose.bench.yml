@@ -1,0 +1,57 @@
+# 压测专用覆盖层（M7-T4）—— 必须和主 compose 一起用
+#
+#   压测：  docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d --build
+#   还原：  docker compose up -d
+#
+# ── 三件事，缺一件数字就不可信 ──────────────────────────────────────────
+#   ① 独立 schema：DATABASE_URL 指向 ?schema=bench
+#      压测会产生几万条事件，写进 public 会污染开发库（看板数字、指纹统计全变），
+#      而且事后清不干净。独立 schema 之后，清理就是一句 DROP SCHEMA bench CASCADE。
+#   ② 固定 CPU：SRS §13.1 的固定变量 cpus=2，NFR-1.1「2 核下 ≥5000 req/s」按它定义。
+#   ③ 关限流 + 降日志：RATE_LIMIT_ENABLED=false，否则测的是 Lua 限流器的上限；
+#      LOG_LEVEL=warn，否则 pino 每条上报打一行 JSON，吃掉 20~30% 吞吐。
+#
+# ── 为什么不用 e2e schema ───────────────────────────────────────────────
+# e2e 的 resetDb() 会 TRUNCATE 全部业务表（test/helpers/fixtures.ts）。
+# 压测期间只要跑一次 e2e（或 CI 跑一个 PR），压测数据就被清空；
+# 反过来压测残留也会让 e2e 的断言看到脏数据。
+# 三个抽屉各用各的：public（开发看板） / e2e（测试） / bench（压测）。
+#
+# ── 首次使用：把身份数据（组织 / 项目 / 公钥）复制进 bench ──────────────
+# bench schema 建好后是空的 —— 没有项目就没有公钥，上报会全线 401。
+# 这里刻意**不跑 seed**（下面把 migrate 的 entrypoint 改掉了）：seed 会
+# generatePublicKey() 随机生成一把新钥匙，于是每重建一次 schema，BENCH_KEY 就得换。
+# 复制 public 的身份行，公钥始终保持同一把：
+#
+#   docker exec argus-postgres-1 psql -U argus -d argus -c "INSERT INTO bench.organizations SELECT * FROM public.organizations ON CONFLICT DO NOTHING; INSERT INTO bench.projects SELECT * FROM public.projects ON CONFLICT DO NOTHING; INSERT INTO bench.project_keys SELECT * FROM public.project_keys ON CONFLICT DO NOTHING;"
+#
+# ── 压完清理（下次压测重新 migrate + 复制身份行即可）─────────────────────
+#   docker exec argus-postgres-1 psql -U argus -d argus -c "DROP SCHEMA bench CASCADE;"
+#
+# ── 验证 ────────────────────────────────────────────────────────────────
+#   docker exec argus-api-1 cat /sys/fs/cgroup/cpu.max          → 200000 100000
+#   docker exec argus-api-1 env | Select-String 'RATE_LIMIT|LOG_LEVEL|DATABASE_URL'
+#
+# 注：compose 对 environment 是**合并**语义（后一份覆盖同名键），
+# 所以这里只写要改的几项，JWT_SECRET / REDIS_HOST 等仍来自主文件。
+services:
+  migrate:
+    # 只建表，不 seed（理由见上）。migrate deploy 会自己 CREATE SCHEMA bench。
+    entrypoint: ["sh", "-c", "npx prisma migrate deploy"]
+    environment:
+      DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=bench
+
+  api:
+    cpus: "2"
+    mem_limit: "2g"
+    environment:
+      DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=bench
+      RATE_LIMIT_ENABLED: "false"
+      LOG_LEVEL: "warn"
+
+  worker:
+    # 和 api 同机。不限的话它会抢 CPU，"api 的 2 核"实际拿不满，噪声每次不同。
+    cpus: "1"
+    environment:
+      DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=bench
+      LOG_LEVEL: "warn"
