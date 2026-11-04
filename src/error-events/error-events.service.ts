@@ -17,6 +17,14 @@ export interface IngestResult {
   duplicate: boolean;
 }
 
+/** 批量上报的响应。`accepted + duplicates === 请求里的 events.length` */
+export interface BatchIngestResult {
+  /** 真正插入的行数 */
+  accepted: number;
+  /** event_id 已存在而被跳过（`ON CONFLICT DO NOTHING`）的条数 */
+  duplicates: number;
+}
+
 @Injectable()
 export class ErrorEventsService {
   private readonly logger = new Logger(ErrorEventsService.name);
@@ -133,6 +141,108 @@ export class ErrorEventsService {
     await this.enqueue(payload.event_id, projectId, requestId);
 
     return { event_id: payload.event_id, duplicate: false };
+  }
+
+  /**
+   * 批量写入（`POST /api/v1/error/batch`）。与 `ingest()` 的差别只有"一次多条"，
+   * 入库、会话、入队三件事的语义完全一致。
+   *
+   * ── 为什么同步落库，而不是"先回 202 再异步写" ─────────────────────────
+   * 这是一次**刻意的一致性取舍**：先落库保证不丢，靠批量摊薄往返。
+   * 若改成响应早于持久化，进程在两步之间崩溃就会静默丢数据，
+   * 而丢的是错误事件 —— 监控系统丢证据是最不可接受的失败。
+   * 代价是这条路径不满足 TC-02「上报热路径不访问数据库」的字面要求，
+   * 与既有的单条路径同源，已在 docs/进度与决策.md 记录。
+   *
+   * ── 为什么用 createManyAndReturn 而不是 createMany ─────────────────────
+   * `createMany` 只返回 count：能算出 duplicates，但**不知道哪几条是新的**，
+   * 于是没法只给新事件入队（多投的 job 会被 worker 的 processed_at 闸门跳过，
+   * 正确性不丢，但白写一遍 Redis）。`createManyAndReturn` 返回真正插入的行，
+   * 一举解决：accepted = 返回行数，duplicates = 总数 - accepted。
+   */
+  async ingestBatch(
+    events: IngestErrorDto[],
+    projectId: string,
+    requestId?: string,
+  ): Promise<BatchIngestResult> {
+    const rows = events.map((e) => this.toRow(e, projectId));
+
+    const inserted = await this.prisma.errorEvent.createManyAndReturn({
+      data: rows,
+      // → ON CONFLICT DO NOTHING：撞 event_id 主键就跳过，不抛错
+      skipDuplicates: true,
+      select: { eventId: true },
+    });
+
+    // 指标按"批"记一次（MVP）。注意这会低估事件数，见文档里的改进项
+    this.metrics.recordIngest(projectId);
+
+    await this.touchSessions(events, projectId);
+    await this.enqueueMany(
+      inserted.map((row) => row.eventId),
+      projectId,
+      requestId,
+    );
+
+    return { accepted: inserted.length, duplicates: rows.length - inserted.length };
+  }
+
+  /**
+   * 会话写入：按 `session_id` 去重，一个会话只 touch 一次。
+   *
+   * 批量之后这一步更重要：SDK 的攒批窗口是 5 秒，同一会话里连续几条错误
+   * 几乎必然落在同一批里 —— 不去重就是 N 次 UPSERT 打同一行 sessions，
+   * 正是压测里花力气消除的那种单行行锁。
+   *
+   * 顺序写而不是 Promise.all：会话数通常远小于事件数，
+   * 真出现 50 个不同会话时并发会打满 Prisma 连接池，得不偿失。
+   */
+  private async touchSessions(events: IngestErrorDto[], projectId: string): Promise<void> {
+    const seen = new Map<string, IngestErrorDto>();
+    for (const e of events) {
+      const sid = e.session_id?.trim();
+      if (sid && !seen.has(sid)) seen.set(sid, e);
+    }
+
+    for (const e of seen.values()) {
+      await this.sessions.touch({
+        projectId,
+        sessionId: e.session_id,
+        userKey: e.user?.id ?? null,
+        at: e.timestamp ? new Date(e.timestamp) : new Date(),
+        hasError: true,
+      });
+    }
+  }
+
+  /**
+   * 批量入队：一次 `addBulk` 等于一次 Redis 往返，而不是 N 次。
+   *
+   * 失败处理与单条路径同一立场：事件已经落库，入队失败只意味着"暂时没人处理"，
+   * 由补扫任务按 `processed_at IS NULL` 捞回来；抛出去反而会让 SDK 收到非 2xx
+   * 而丢掉整批（SDK 不重试）。
+   */
+  private async enqueueMany(
+    eventIds: string[],
+    projectId: string,
+    requestId?: string,
+  ): Promise<void> {
+    if (eventIds.length === 0) return;
+
+    try {
+      await this.queues.queueFor(projectId).addBulk(
+        eventIds.map((eventId) => ({
+          name: ERROR_EVENT_JOB,
+          data: { eventId, requestId },
+          opts: { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(eventId) },
+        })),
+      );
+    } catch (err) {
+      this.logger.error(
+        `批量入队失败，${eventIds.length} 条已入库但尚未归并（等补扫兜住）: ` +
+          `project=${projectId} requestId=${requestId ?? '-'} 原因=${String(err)}`,
+      );
+    }
   }
 
   /**

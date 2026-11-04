@@ -1,15 +1,16 @@
-import { Body, Controller, Get, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ProjectScopeGuard } from '../auth/project-scope.guard';
 import { TenantPageQueryDto } from '../common/dto/tenant-query.dto';
 import { IngestProject } from '../ratelimit/ingest-context';
 import type { IngestContext } from '../ratelimit/ingest-context';
 import { IngestRateLimitGuard } from '../ratelimit/ingest-rate-limit.guard';
+import { EnvelopeDto } from './dto/envelope.dto';
 import { IngestErrorDto } from './dto/ingest-error.dto';
 import { ErrorEventsService } from './error-events.service';
 // interface 只用于类型，在装饰器签名里必须用 import type，
 // 否则 isolatedModules + emitDecoratorMetadata 会报错
-import type { IngestResult } from './error-events.service';
+import type { BatchIngestResult, IngestResult } from './error-events.service';
 
 /**
  * 异常事件：上报 + 查询。
@@ -51,6 +52,32 @@ export class ErrorEventsController {
     @Req() req: { id?: string },
   ): Promise<IngestResult> {
     return this.service.ingest(body, project.projectId, req.id);
+  }
+
+  /**
+   * POST /api/v1/error/batch —— 批量上报（SDK 的默认出口）。
+   *
+   * 形状由 SDK 决定：`sendBatch()` 发的是 `{ events: CapturedError[] }`，
+   * 最多 50 条（SDK 攒满即发，见 Argus-Util/sdk/index.ts 的 MAX_BATCH）。
+   *
+   * ── 为什么返回 202 ──────────────────────────────────────────────────────
+   * 语义是"已接受"，且不再逐条回传 event_id。SDK 只判断 `res.ok`（200~299），
+   * 所以 202 与 201 对它等价；选 202 是为了让状态码本身表达"批量受理"。
+   *
+   * ── 为什么 400 的代价比单条接口大得多 ─────────────────────────────────
+   * SDK **不重试、也不解析响应体**，只 console.warn。所以只要 1 条事件的字段
+   * 超长，ValidationPipe 就会否掉整批 50 条 —— 一条坏数据毁掉 49 条好数据。
+   * 这是批量上报的固有代价，单条模式没有。
+   */
+  @Post('error/batch')
+  @UseGuards(IngestRateLimitGuard)
+  @HttpCode(HttpStatus.ACCEPTED)
+  async storeBatch(
+    @Body() body: EnvelopeDto,
+    @IngestProject() project: IngestContext,
+    @Req() req: { id?: string },
+  ): Promise<BatchIngestResult> {
+    return this.service.ingestBatch(body.events, project.projectId, req.id);
   }
 
   /**
