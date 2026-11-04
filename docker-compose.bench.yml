@@ -42,6 +42,9 @@ services:
       DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=bench
 
   api:
+    # SRS §13.1 的固定变量：2 核（NFR-1.1「2 核下 ≥5000 req/s」按它定义）。
+    # 曾临时改为 "4" 做「配额是否决定上限」的对照，结论见
+    # backend/bench/压测报告.md §7：加核无提升，主线程才是瓶颈。已还原。
     cpus: "2"
     mem_limit: "2g"
     environment:
