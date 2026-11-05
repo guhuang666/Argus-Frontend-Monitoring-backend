@@ -2,7 +2,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable, Logger } from '@nestjs/common';
 import type { Job, Queue } from 'bullmq';
 import { randomUUID } from 'node:crypto';
-import type { Prisma } from '../../generated/prisma/client';
+import { Prisma } from '../../generated/prisma/client';
 import { WorkerMetricsService } from '../metrics/worker-metrics.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -10,6 +10,7 @@ import {
   ERROR_EVENT_DLQ,
   ERROR_EVENT_JOB,
   ERROR_EVENT_QUEUE,
+  jobEventIds,
   toJobId,
   type ErrorEventDlqData,
   type ErrorEventJobData,
@@ -82,6 +83,37 @@ interface ClaimOutcome {
   symbolicated: boolean;
 }
 
+/** claimMany() 的产出汇总，只用于一行日志 */
+interface BatchOutcome {
+  /** 真正抢到并归并的条数 */
+  claimed: number;
+  /** 没抢到（重复投递 / 事件不存在）的条数 */
+  skipped: number;
+  /** 本批落到几个问题（指纹）上 */
+  groups: number;
+  /** 其中多少条走了 v2-symbolicated */
+  symbolicated: number;
+  /** 每个问题归并后的 times_seen，用于验收「批量累加对不对」 */
+  timesSeenByGroup: string[];
+}
+
+/** 一个指纹桶：本批里所有归到同一问题的事件 */
+interface FingerprintBucket {
+  projectId: string;
+  groupingVersion: string;
+  fingerprint: string;
+  title: string;
+  /**
+   * 出错位置。`buildCulprit()` 在栈里找不到可用帧时会返回 null ——
+   * error_groups.culprit 本身可空，这里的类型必须跟着放宽，
+   * 否则这桶会被当成"类型不匹配"而落不进 Map。
+   */
+  culprit: string | null;
+  /** 归并成功后回填的 group id */
+  groupId?: string;
+  items: Array<{ event: ClaimedEvent; framesToStore: unknown[] }>;
+}
+
 /**
  * 归并 Worker 的消费逻辑（W3 骨架 + W4 归并；M4-S7 起不再自己挂 Worker）。
  *
@@ -127,30 +159,322 @@ export class ErrorEventProcessor {
    * 不要自己吞掉错误假装成功 —— 吞掉等于永久丢失这条事件的归并。
    */
   async handle(job: Job<ErrorEventJobData>): Promise<void> {
-    const { eventId, requestId } = job.data;
-    const outcome = await this.claim(eventId);
+    const eventIds = jobEventIds(job.data);
+    const requestId = job.data.requestId;
 
-    if (outcome === null) {
-      // 声明失败有两种可能，分开记：区分"重复投递"和"job 指向了不存在的事件"
-      await this.explainUnclaimed(eventId, requestId);
+    if (eventIds.length === 0) {
+      this.logger.warn(`job 载荷里没有事件主键，跳过: jobId=${job.id ?? '-'}`);
       return;
     }
 
-    const { event, fingerprint, groupId, timesSeen, symbolicated } = outcome;
-    // 日志带上 group / fingerprint / times：验收时不用查库就能看出
-    // 两条上报有没有落进同一个问题里。
-    // sym=v2/raw=v1 同理：符号化有没有生效，一条日志就能判断
-    //
-    // requestId（M6-6）：API 侧那次 HTTP 请求的 id，由 job.data 带进来。
-    // 用同一个值 grep 两个进程的日志，就能把「上报」和「归并」拼成一条链路。
-    // 老 job（M6-6 之前投递的）没有这个字段 → 打 `-`，不影响任何逻辑。
+    // ── 老 job 兼容（M7-T5 之前投递的）──────────────────────────────
+    // 它们的载荷只有 `eventId`。这些 job 跑完就再也不会产生了，
+    // 所以保留原来那条逐条路径，不改动它 —— 改造期间队列里可能还压着它们。
+    if (job.data.eventIds === undefined) {
+      const outcome = await this.claim(eventIds[0]);
+
+      if (outcome === null) {
+        await this.explainUnclaimed(eventIds[0], requestId);
+        return;
+      }
+
+      const { event, fingerprint, groupId, timesSeen, symbolicated } = outcome;
+      this.logger.log(
+        `已消费 event_id=${eventIds[0]} requestId=${requestId ?? '-'} ` +
+          `group=${groupId.slice(0, 8)} ` +
+          `fp=${fingerprint.slice(0, 8)} times=${timesSeen} ` +
+          `ver=${symbolicated ? 'v2' : 'v1'} ` +
+          `mechanism=${event.mechanism} type=${event.type} ` +
+          `message="${truncate(event.message, LOG_MESSAGE_LIMIT)}"`,
+      );
+      return;
+    }
+
+    // ── 批量路径（M7-T5）──────────────────────────────────────────────
+    const summary = await this.claimMany(eventIds);
+
+    if (summary.claimed === 0) {
+      // 整批都没抢到：多半是重复投递（退场时 visibilitychange + pagehide 会发两次）
+      await this.explainUnclaimed(eventIds[0], requestId);
+      return;
+    }
+
+    // 一条汇总日志而不是 N 条：批量之后逐条打会把日志量放大 50 倍，
+    // 而排查时真正需要的是「这一批进了几个问题、跳过几条」。
     this.logger.log(
-      `已消费 event_id=${eventId} requestId=${requestId ?? '-'} ` +
-        `group=${groupId.slice(0, 8)} ` +
-        `fp=${fingerprint.slice(0, 8)} times=${timesSeen} ` +
-        `ver=${symbolicated ? 'v2' : 'v1'} ` +
-        `mechanism=${event.mechanism} type=${event.type} ` +
-        `message="${truncate(event.message, LOG_MESSAGE_LIMIT)}"`,
+      `已消费 ${summary.claimed}/${eventIds.length} 条 requestId=${requestId ?? '-'} ` +
+        `groups=${summary.groups} skipped=${summary.skipped} ` +
+        `symbolicated=${summary.symbolicated}/${summary.claimed} ` +
+        `times=${summary.timesSeenByGroup.join('/')}`,
+    );
+  }
+
+  /**
+   * 批量声明 + 批量归并（M7-T5）。
+   *
+   * ── 为什么批量能提消费速率 ─────────────────────────────────────────────
+   * 逐条处理时，每事件要写 4~5 条 SQL，其中**两条打在同一行 error_groups**
+   * （upsert 的 times_seen +1、以及新用户时的 users_seen +1）。高并发下所有
+   * 消费者都在抢这一行，行锁把本来能并行的活串行化了。
+   *
+   * 批量之后，N 条事件如果落进同一个指纹：
+   *   声明 1 条 + upsert 1 条（times_seen += N）+ affected_users 1 条
+   *   + 小时聚合 1 条 + 回填 1 条 = **5 条 SQL 处理 N 条事件**
+   * 而不是 5N 条。写同一行的次数从 N 次降到 1 次 —— 这才是收益来源。
+   *
+   * ── 为什么仍然整批一个事务 ─────────────────────────────────────────────
+   * 见类注释：归并必须和"声明"在同一个事务里，否则失败重试会被自己的闸门
+   * （processed_at 已置位）挡在门外，事件永久丢失且不报错。
+   *
+   * ── 时间桶为什么要按时间戳做 Map key 去重 ───────────────────────────────
+   * `toHourBucket()` 返回的是 Date 对象，`Date` 作为 Map 的 key 用的是**对象标识**
+   * 而不是值 —— 两个内容相同的 Date 是两个不同的 key。必须用 getTime() 归一。
+   */
+  private async claimMany(eventIds: string[]): Promise<BatchOutcome> {
+    return this.prisma.$transaction(
+      async (tx) => {
+        // ① 一条 UPDATE 声明整批：抢到的才归我处理，抢不到的（已处理过）自动略过
+        const claimed = await tx.$queryRaw<ClaimedEvent[]>`
+          UPDATE error_events
+             SET processed_at = now()
+           WHERE event_id IN (${Prisma.join(eventIds)})
+             AND processed_at IS NULL
+          RETURNING event_id, mechanism, "type", message, stack, timestamp, release, project_id, user_id, environment
+        `;
+
+        if (claimed.length === 0) {
+          return {
+            claimed: 0,
+            skipped: eventIds.length,
+            groups: 0,
+            symbolicated: 0,
+            timesSeenByGroup: [],
+          };
+        }
+
+        // ② 逐条算指纹（CPU + 可能的 Sourcemap 读），再按指纹聚成桶
+        const buckets = new Map<string, FingerprintBucket>();
+        let symbolicated = 0;
+
+        for (const ev of claimed) {
+          const frames = parseFrames(ev.stack);
+          const resolution = await this.sourcemaps.symbolicate(
+            tx,
+            ev.project_id,
+            ev.release,
+            frames,
+          );
+          const isSymbolicated = resolution.allResolved;
+          if (isSymbolicated) symbolicated += 1;
+
+          const groupingVersion = isSymbolicated
+            ? GROUPING_VERSION_SYMBOLICATED
+            : GROUPING_VERSION_RAW;
+
+          const fingerprint = isSymbolicated
+            ? computeSymbolicatedFingerprint({
+                type: ev.type,
+                message: ev.message,
+                frames: resolution.frames,
+              })
+            : computeFingerprint({
+                type: ev.type,
+                message: ev.message,
+                stack: ev.stack,
+              });
+
+          const key = `${ev.project_id}::${groupingVersion}::${fingerprint}`;
+          let bucket = buckets.get(key);
+          if (bucket === undefined) {
+            bucket = {
+              projectId: ev.project_id,
+              groupingVersion,
+              fingerprint,
+              title: buildTitle(ev.type, ev.message),
+              culprit: isSymbolicated
+                ? buildSymbolicatedCulprit(resolution.frames)
+                : buildCulprit(frames),
+              items: [],
+            };
+            buckets.set(key, bucket);
+          }
+
+          bucket.items.push({
+            event: ev,
+            framesToStore: isSymbolicated ? resolution.frames : frames,
+          });
+        }
+
+        // ③ 每个指纹桶：一次 upsert 把 times_seen 累加 k 条
+        const timesSeenByGroup: string[] = [];
+
+        for (const bucket of buckets.values()) {
+          const k = bucket.items.length;
+          const first = bucket.items.reduce((a, b) =>
+            b.event.timestamp < a.event.timestamp ? b : a,
+          );
+          const latest = bucket.items.reduce((a, b) =>
+            b.event.timestamp > a.event.timestamp ? b : a,
+          );
+
+          const group = await tx.errorGroup.upsert({
+            where: {
+              projectId_groupingVersion_fingerprint: {
+                projectId: bucket.projectId,
+                groupingVersion: bucket.groupingVersion,
+                fingerprint: bucket.fingerprint,
+              },
+            },
+            create: {
+              projectId: bucket.projectId,
+              groupingVersion: bucket.groupingVersion,
+              fingerprint: bucket.fingerprint,
+              title: bucket.title,
+              culprit: bucket.culprit,
+              firstSeen: first.event.timestamp,
+              lastSeen: latest.event.timestamp,
+              // 首次创建时直接写 k，而不是 1 —— 本批这 k 条就是它的全部历史
+              timesSeen: k,
+              firstRelease: first.event.release,
+              lastRelease: latest.event.release,
+              lastEnvironment: latest.event.environment,
+            },
+            update: {
+              lastSeen: latest.event.timestamp,
+              // 与逐条路径同一条规则：没配版本/环境的不能把已有值抹成 NULL
+              ...(latest.event.release !== null
+                ? { lastRelease: latest.event.release }
+                : {}),
+              ...(latest.event.environment !== null
+                ? { lastEnvironment: latest.event.environment }
+                : {}),
+              // 原子累加 k，而不是增 1
+              timesSeen: { increment: k },
+            },
+          });
+
+          timesSeenByGroup.push(String(group.timesSeen));
+          bucket.groupId = group.id;
+
+          // FR-4.8 状态机：已解决又出事 → 回归未处理（稀有路径，保持不变）
+          if (group.status === 'resolved') {
+            await tx.errorGroup.update({
+              where: { id: group.id },
+              data: { status: 'unresolved', resolvedAt: null },
+            });
+            this.logger.log(
+              `问题回归: id=${group.id} resolved → unresolved（收到新事件）`,
+            );
+          }
+
+          // ④ 影响用户：桶内去重后一次插入，只把"真的新增"计入 users_seen
+          const userIds = [
+            ...new Set(
+              bucket.items
+                .map((item) => item.event.user_id)
+                .filter((id): id is string => id !== null && id !== undefined),
+            ),
+          ];
+
+          let newUsers = 0;
+          if (userIds.length > 0) {
+            const inserted = await tx.affectedUser.createMany({
+              data: userIds.map((userKey) => ({
+                projectId: bucket.projectId,
+                groupId: group.id,
+                userKey,
+                firstRelease: first.event.release,
+              })),
+              skipDuplicates: true,
+            });
+            newUsers = inserted.count;
+
+            if (newUsers > 0) {
+              await tx.errorGroup.update({
+                where: { id: group.id },
+                data: { usersSeen: { increment: newUsers } },
+              });
+            }
+          }
+
+          // ⑤ 小时聚合：按事件时间分桶，每桶一次 upsert，event_count 累加该桶条数
+          const byHour = new Map<number, { hour: Date; count: number }>();
+          for (const item of bucket.items) {
+            const hour = toHourBucket(item.event.timestamp);
+            const entry = byHour.get(hour.getTime());
+            if (entry === undefined) byHour.set(hour.getTime(), { hour, count: 1 });
+            else entry.count += 1;
+          }
+
+          // user_count 只能归属到某一小时：统一记到本批最新事件所属的小时桶。
+          // 逐条路径是"每条各自 +0/1"，批次化之后无法再把新增用户精确拆到各小时；
+          // 同一小时内的结果完全一致（bench 与绝大多数真实批次都属于这种情况）。
+          const latestHourKey = toHourBucket(latest.event.timestamp).getTime();
+
+          for (const [key, entry] of byHour) {
+            const isLatestHour = key === latestHourKey;
+            await tx.issueStatHourly.upsert({
+              where: {
+                projectId_groupId_hour: {
+                  projectId: bucket.projectId,
+                  groupId: group.id,
+                  hour: entry.hour,
+                },
+              },
+              create: {
+                projectId: bucket.projectId,
+                groupId: group.id,
+                hour: entry.hour,
+                eventCount: entry.count,
+                userCount: isLatestHour ? newUsers : 0,
+              },
+              update: {
+                eventCount: { increment: entry.count },
+                ...(isLatestHour && newUsers > 0
+                  ? { userCount: { increment: newUsers } }
+                  : {}),
+              },
+            });
+          }
+        }
+
+        // ⑥ 回填 group_id + 符号化 frames：一条 SQL 更新整批。
+        // 逐条 update 会再打 N 次数据库，把批量省下的往返又还回去。
+        const values: Prisma.Sql[] = [];
+        for (const bucket of buckets.values()) {
+          for (const item of bucket.items) {
+            const framesJson =
+              item.framesToStore.length > 0
+                ? JSON.stringify(item.framesToStore)
+                : null;
+            values.push(
+              Prisma.sql`(${item.event.event_id}::text, ${bucket.groupId}::uuid, ${
+                framesJson
+              }::jsonb)`,
+            );
+          }
+        }
+
+        await tx.$executeRaw`
+          UPDATE error_events AS e
+             SET group_id = v.group_id,
+                 -- 没有 frames 时不覆盖原有值（与逐条路径"字段整个不出现"等价）
+                 stacktrace_frames = COALESCE(v.frames, e.stacktrace_frames)
+            FROM (VALUES ${Prisma.join(values)}) AS v(event_id, group_id, frames)
+           WHERE e.event_id = v.event_id
+        `;
+
+        return {
+          claimed: claimed.length,
+          skipped: eventIds.length - claimed.length,
+          groups: buckets.size,
+          symbolicated,
+          timesSeenByGroup,
+        };
+      },
+      // 50 条一批时，符号化（首次可能读盘解析）+ 5 条 SQL 仍可能在慢盘上超过
+      // Prisma 默认的 5 秒事务上限，这里显式放宽
+      { timeout: 30_000, maxWait: 10_000 },
     );
   }
 
@@ -425,7 +749,11 @@ export class ErrorEventProcessor {
     }
 
     const attempts = job.opts.attempts ?? 1;
-    const eventId = job.data.eventId;
+    // M7-T5 起一个 job 可能带多条主键。DLQ 里必须把**整批**都留下来，
+    // 否则失败现场只剩下一个代表 id，其余事件永远查不到是被哪次失败带走的。
+    const eventIds = jobEventIds(job.data);
+    /** 只用于日志/前缀的那一个代表 id */
+    const eventId = eventIds[0] ?? '(unknown)';
     // requestId 跟着 job 一起进来，这里必须**接着往下传**（进 DLQ 载荷 + 日志）：
     // 一条事件最终进了死信，几乎是最需要回溯"它当初是从哪次请求来的"的场景
     const requestId = job.data.requestId;
@@ -441,6 +769,7 @@ export class ErrorEventProcessor {
 
     // 重试耗尽 → 转 DLQ
     const payload: ErrorEventDlqData = {
+      eventIds,
       eventId,
       requestId,
       failedReason: err.message,

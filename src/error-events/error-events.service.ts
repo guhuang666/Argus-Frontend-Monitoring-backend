@@ -138,7 +138,9 @@ export class ErrorEventsService {
       hasError: true,
     });
 
-    await this.enqueue(payload.event_id, projectId, requestId);
+    // 长度 1 也走批量路径：消费端只有 claimMany 一条代码路径，
+    // 不必为"1 条"和"多条"各维护一套归并逻辑
+    await this.enqueueMany([payload.event_id], projectId, requestId);
 
     return { event_id: payload.event_id, duplicate: false };
   }
@@ -216,11 +218,41 @@ export class ErrorEventsService {
   }
 
   /**
-   * 批量入队：一次 `addBulk` 等于一次 Redis 往返，而不是 N 次。
+   * 投递归并任务：**一个 job 带整批主键**，只占一次 Redis 往返。
    *
-   * 失败处理与单条路径同一立场：事件已经落库，入队失败只意味着"暂时没人处理"，
-   * 由补扫任务按 `processed_at IS NULL` 捞回来；抛出去反而会让 SDK 收到非 2xx
-   * 而丢掉整批（SDK 不重试）。
+   * 单条上报调用时传 `[eventId]`（长度 1），批量上报传整批（最多 50）。
+   * 两条路径共用这一个方法 —— 此前还有一个只收单个 id 的 `enqueue()`，
+   * 它与 `enqueueMany([id])` 逐行等价（连 jobId 都是 `toJobId(eventIds[0])`），
+   * 留着只会让"改一处忘另一处"有机会发生，已合并。
+   *
+   * ── M7-T5 起为什么不投 N 个 job ────────────────────────────────────────
+   * 投 N 个 job 只是让"入队"变快，消费端仍然逐条处理，而消费端每个事件要写
+   * 4~5 条 SQL（其中 2 条打在同一行 error_groups）。真正省时间的是让消费端
+   * 一次性拿到 N 个主键 —— 归并时 times_seen 一次 += N。
+   * 实测：逐条消费 ≈63 events/s → 批量 ≈688 events/s（见 bench/压测报告.md §14）。
+   *
+   * ── jobId 用第一个主键 ────────────────────────────────────────────────
+   * BullMQ 在队列里已有同 jobId 的 job 时会**静默忽略**这次 add（不报错、也不新建，
+   * 见 addStandardJob-9.js 的 handleDuplicatedJob），这是防重复入队的第一道闸。
+   * 它是"静默"的：别指望靠 catch 判断有没有入队成功。
+   * 批内主键全局唯一，所以取第一个就足够唯一；形状不合法的（纯数字 / 含冒号）
+   * 由 toJobId 先映射成合法形状。
+   *
+   * ── 失败为什么只记日志、不往上抛 ────────────────────────────────────────
+   * 事件已经落库了，真相保住了；入队失败只意味着"暂时没人处理它"，由补扫任务
+   * 按 `processed_at IS NULL` 兜住。反过来若抛出去：SDK 收到非 2xx 会重试，
+   * 而重试撞主键会被判成 duplicate、在 ingest() 的 duplicate 分支里直接返回 ——
+   * 照样不会入队，还多绕一圈；批量模式下更糟：SDK **不重试**，整批 50 条直接丢。
+   *
+   * ── 只有新事件才入队 ───────────────────────────────────────────────────
+   * duplicate 分支不入队：那条事件上一次已经入过队，真要是上次入队失败，
+   * 补扫会按 processed_at IS NULL 把它捞回来。
+   *
+   * ── requestId 进 job.data ──────────────────────────────────────────────
+   * job.data 里本来就只带主键（见 queue.constants 的"只带主键"约定），
+   * requestId 是**唯一**的例外：它不是业务数据、不落库、只出现在日志里，
+   * 但它是跨进程串联的唯一线索，丢了就再也补不回来（Worker 拿不到 HTTP 上下文）。
+   * 值为 undefined 时按 BullMQ 的行为会被序列化丢掉，Worker 侧按"没有"处理。
    */
   private async enqueueMany(
     eventIds: string[],
@@ -230,61 +262,19 @@ export class ErrorEventsService {
     if (eventIds.length === 0) return;
 
     try {
-      await this.queues.queueFor(projectId).addBulk(
-        eventIds.map((eventId) => ({
-          name: ERROR_EVENT_JOB,
-          data: { eventId, requestId },
-          opts: { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(eventId) },
-        })),
-      );
-    } catch (err) {
-      this.logger.error(
-        `批量入队失败，${eventIds.length} 条已入库但尚未归并（等补扫兜住）: ` +
-          `project=${projectId} requestId=${requestId ?? '-'} 原因=${String(err)}`,
-      );
-    }
-  }
-
-  /**
-   * 投递一条归并任务。
-   *
-   * ── jobId 用 event_id ──────────────────────────────────────────────────
-   * 队列里同 jobId 的 job 还在时，BullMQ 会**静默忽略**这次 add（不报错、也不新建，
-   * 见 addStandardJob-9.js 的 handleDuplicatedJob），这是防重复入队的第一道闸。
-   * 注意它是"静默"的：别指望靠 catch 判断有没有入队成功。
-   * 形状不合法的 id（纯数字 / 含冒号）由 toJobId 先映射成合法形状。
-   *
-   * ── 失败为什么只记日志、不往上抛 ────────────────────────────────────────
-   * 事件已经落库了，真相保住了；入队失败只意味着"暂时没人处理它"，由补扫任务兜住。
-   * 反过来若抛出去：SDK 收到 500 会重试，而重试撞主键会被判成 duplicate、
-   * 在下面那条 duplicate 分支里直接返回 —— 照样不会入队，还多绕一圈。
-   *
-   * ── 只有新事件才入队 ───────────────────────────────────────────────────
-   * duplicate 分支不入队：这条事件上一次已经入过队（jobId 相同，去重窗口内会被
-   * 静默忽略），真要是上次入队失败，补扫会按 processed_at IS NULL 把它捞回来。
-   *
-   * ── requestId 进 job.data ──────────────────────────────────────────────
-   * job.data 里本来就只带主键（见 queue.constants 的"只带主键"约定），
-   * requestId 是**唯一**的例外：它不是业务数据、不落库、只出现在日志里，
-   * 但它是跨进程串联的唯一线索，丢了就再也补不回来（Worker 拿不到 HTTP 上下文）。
-   * 值为 undefined 时按 BullMQ 的行为会被序列化丢掉，Worker 侧按"没有"处理。
-   */
-  private async enqueue(
-    eventId: string,
-    projectId: string,
-    requestId?: string,
-  ): Promise<void> {
-    try {
-      // S7：投到**这个项目的**队列，而不是全局那条
       await this.queues.queueFor(projectId).add(
         ERROR_EVENT_JOB,
-        { eventId, requestId },
-        { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(eventId) },
+        { eventIds, requestId },
+        { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(eventIds[0]) },
       );
     } catch (err) {
+      // 日志里保留**首条** event_id：单条上报时它就是那条事件的花名册；
+      // 批量时给出总数 + 一个可 grep 的代表，不需要把 50 个 id 全打出来。
       this.logger.error(
-        `入队失败，事件已入库但尚未归并（等补扫兜住）: event_id=${eventId} ` +
-          `project=${projectId} requestId=${requestId ?? '-'} 原因=${String(err)}`,
+        `入队失败，${eventIds.length} 条已入库但尚未归并（等补扫兜住）: ` +
+          `event_id=${eventIds[0]}` +
+          (eventIds.length > 1 ? ` 等 ${eventIds.length} 条` : '') +
+          ` project=${projectId} requestId=${requestId ?? '-'} 原因=${String(err)}`,
       );
     }
   }

@@ -57,9 +57,30 @@ export const ERROR_EVENT_JOB = 'error-event';
  * 明细（type / message / stack）从 PG 现读，不在 Redis 里存第二份 —— 否则事件在
  * 入库后被修正、或者 schema 演进时，队列里那份就成了过期真相。载荷小还有个副作用
  * 是好事：job 越小，Redis 内存和网络开销越低。
+ *
+ * ── 为什么是数组（M7-T5 批量消费）────────────────────────────────────────
+ * 一个 job 处理 N 条事件（N ≥ 1）。归并端据此把 N 次「UPDATE 同一行 error_groups」
+ * 合并成 1 次，这是消费速率的**唯一**大幅提升手段：
+ *   · 逐条消费：每事件 4~5 条 SQL（其中 2 条写同一行 error_groups）
+ *   · 批量 50：50 条事件只需 ~6 条 SQL（times_seen 一次 +=50）
+ *
+ * 只带主键的约定不变 —— 数组里放的仍然是 event_id，不是明细。
  */
 export interface ErrorEventJobData {
-  eventId: string;
+  /**
+   * 本 job 要处理的事件主键。
+   *
+   * 单条上报也走这里（长度 1）—— 消费端只有一条代码路径，
+   * 不必为"1 条"和"多条"各维护一套归并逻辑。
+   *
+   * 可空仅为兼容：M7-T5 之前投递、仍在队列里的老 job 只有 `eventId`。
+   */
+  eventIds?: string[];
+  /**
+   * @deprecated 老 job 的单条载荷形状。**生产侧不再写入**，
+   * 只有消费侧用它兜住队列里在途的老 job，跑完这批就彻底没用了。
+   */
+  eventId?: string;
   /**
    * 产生这条 job 的 HTTP 请求 id（M6-6）。
    *
@@ -69,6 +90,20 @@ export interface ErrorEventJobData {
    * 可空：脚本 / 补扫任务直接入队时没有 HTTP 上下文。
    */
   requestId?: string;
+}
+
+/**
+ * 从 job 载荷里取出要处理的事件主键，兼容新老两种形状。
+ *
+ * 单独成函数而不是散在处理器里：这是"新老载荷"唯一的接缝，
+ * 集中在一处，老形状什么时候能删一眼可见。
+ */
+export function jobEventIds(data: ErrorEventJobData | undefined): string[] {
+  if (data === undefined) return [];
+  if (Array.isArray(data.eventIds) && data.eventIds.length > 0) return data.eventIds;
+  // 兼容 M7-T5 之前投递的老 job
+  if (typeof data.eventId === 'string' && data.eventId !== '') return [data.eventId];
+  return [];
 }
 
 /** 死信载荷：原载荷 + 失败现场，够事后定位就行 */
