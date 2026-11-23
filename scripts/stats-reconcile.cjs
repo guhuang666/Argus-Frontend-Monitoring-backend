@@ -13,18 +13,20 @@
  * 看板上的数字就开始骗人，而且骗得很安静（没人报错，只是曲线不对）。
  * 这个脚本把"同一件事的两种数法"摆在一起比。
  *
- * ── 五条恒等式 ─────────────────────────────────────────────────────────
+ * ── 四条恒等式 ─────────────────────────────────────────────────────────
  *   ① sum(event_count)  == count(error_events WHERE group_id IS NOT NULL)
- *   ② sum(user_count)   == count(affected_users)
- *   ③ 逐组 sum(event_count) == error_groups.times_seen == 该组明细条数
- *   ④ 逐组 sum(user_count)  == error_groups.users_seen
- *   ⑤ hour 必须落在 UTC 整点上（截断规则有没有被改坏的直接证据）
+ *   ② 逐组 sum(event_count) == error_groups.times_seen == 该组明细条数
+ *   ③ 逐组 error_groups.users_seen == count(affected_users WHERE group_id = 该组)
+ *   ④ hour 必须落在 UTC 整点上（截断规则有没有被改坏的直接证据）
  * 外加一条结构检查：
- *   ⑥ 聚合行的 project_id 必须和它所属问题的 project_id 一致
+ *   ⑤ 聚合行的 project_id 必须和它所属问题的 project_id 一致
  *      （外键只约束 group_id 存在，拦不住"写错项目"这种 bug）
  *
- * ①② 是全局守恒，③④ 是逐组守恒。两组都必要：全局相等而逐组不等，
+ * ① 是全局守恒，②③ 是逐组守恒。两组都必要：全局相等而逐组不等，
  * 说明错误在组之间串了（比如 group_id 写错一个），全局检查发现不了。
+ *
+ * ⚠ 用户数不再进聚合表（`issue_stats_hourly.user_count` 已删除）：③ 直接拿
+ * error_groups.users_seen 和 affected_users 的明细条数比，不再经过小时表。
  *
  * ── 为什么不写进单测 ───────────────────────────────────────────────────
  * 这些断言针对的是**数据**，不是代码。单测跑在空库上永远是 100% 通过。
@@ -70,10 +72,8 @@ const GLOBAL_SQL = `
 SELECT
   (SELECT count(*)::int FROM "issue_stats_hourly" WHERE true${scope})                       AS stat_rows,
   (SELECT coalesce(sum("event_count"), 0)::int FROM "issue_stats_hourly" WHERE true${scope}) AS stat_events,
-  (SELECT coalesce(sum("user_count"), 0)::int FROM "issue_stats_hourly" WHERE true${scope})  AS stat_users,
   (SELECT count(*)::int FROM "error_events"
-     WHERE "group_id" IS NOT NULL${scope})                                                 AS detail_events,
-  (SELECT count(*)::int FROM "affected_users" WHERE true${scope})                           AS detail_users
+     WHERE "group_id" IS NOT NULL${scope})                                                 AS detail_events
 `
 
 /**
@@ -92,18 +92,18 @@ SELECT
   g."times_seen"::int             AS times_seen,
   g."users_seen"::int             AS users_seen,
   coalesce(s.events, 0)::int      AS stat_events,
-  coalesce(s.users, 0)::int       AS stat_users,
+  (SELECT count(*)::int FROM "affected_users" a WHERE a."group_id" = g."id") AS detail_users,
   (SELECT count(*)::int FROM "error_events" e WHERE e."group_id" = g."id") AS detail_events
 FROM "error_groups" g
 LEFT JOIN (
-  SELECT "group_id", sum("event_count") AS events, sum("user_count") AS users
+  SELECT "group_id", sum("event_count") AS events
   FROM "issue_stats_hourly"
   GROUP BY "group_id"
 ) s ON s."group_id" = g."id"
 WHERE true${scopeOf('g."project_id"')}
   AND (
     g."times_seen" <> coalesce(s.events, 0)
-    OR g."users_seen" <> coalesce(s.users, 0)
+    OR g."users_seen" <> (SELECT count(*) FROM "affected_users" a WHERE a."group_id" = g."id")
     OR g."times_seen" <> (SELECT count(*) FROM "error_events" e WHERE e."group_id" = g."id")
   )
 ORDER BY g."times_seen" DESC
@@ -146,12 +146,6 @@ async function main() {
       expected: global.detail_events,
       actual: global.stat_events,
       ok: global.stat_events === global.detail_events,
-    },
-    {
-      name: 'sum(user_count) == 去重用户条数',
-      expected: global.detail_users,
-      actual: global.stat_users,
-      ok: global.stat_users === global.detail_users,
     },
     {
       name: '逐组守恒（times_seen / users_seen / 明细条数）',

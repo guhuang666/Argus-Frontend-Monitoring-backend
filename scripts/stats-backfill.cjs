@@ -11,19 +11,11 @@
  * 趋势图会显示"这一周之前一片空白"。回填就是拿明细重新算一遍聚合。
  *
  * ── 数据从哪来（唯一的真相）────────────────────────────────────────────
- *   event_count ← count(error_events)  GROUP BY 项目, 问题, 小时(timestamp)
- *   user_count  ← count(affected_users) GROUP BY 项目, 问题, 小时(first_seen)
+ *   event_count ← count(error_events) GROUP BY 项目, 问题, 小时(timestamp)
  *
- * 两张表都要参与，因为它们的"小时"不完全重合：
- *   · 有事件但没新增用户 —— 老用户又踩了一次（绝大多数桶）
- *   · 有新增用户但事件已过期 —— 明细保留 30 天，affected_users 不会跟着删，
- *     所以第 31~∞ 天可能出现"只有用户数、没有事件数"的桶
- * 只用其中一张表重建，另一个数字就会永久偏小。
- *
- * ⚠ 两个"小时"的来源不同，这是刻意的：
- *   · 事件用 timestamp（客户端时钟）= 和 B2 归并时 toHourBucket(claimed.timestamp) 一致
- *   · 用户用 first_seen（服务端时钟）= 就是"这个用户第一次被记录的时刻"
- *   混用会让回填结果和 B2 实时写入的结果对不上，B4 对账立刻炸。
+ * 只回填**事件数**。用户数已经不进这张表了（`issue_stats_hourly.user_count`
+ * 已删除）：批次归并时"新增用户"是整批一个数、拆不到小时，改为看板直接查
+ * `affected_users.first_seen`（见 stats.service 的 byUsers），不再维护第三份计数。
  *
  * ── 幂等性 ─────────────────────────────────────────────────────────────
  * 先 DELETE 再 INSERT，全部在**一个事务**里。跑 1 次和跑 100 次结果完全相同。
@@ -88,13 +80,12 @@ const DELETE_SQL = `DELETE FROM "issue_stats_hourly" WHERE true${scope}`
  * 硬塞进聚合会让 sum(event_count) 大于"能归属到问题的明细条数"。
  */
 const INSERT_EVENT_COUNTS_SQL = `
-INSERT INTO "issue_stats_hourly" ("project_id", "group_id", "hour", "event_count", "user_count")
+INSERT INTO "issue_stats_hourly" ("project_id", "group_id", "hour", "event_count")
 SELECT
   "project_id",
   "group_id",
   ${HOUR_SQL('timestamp')},
-  count(*)::int,
-  0
+  count(*)::int
 FROM "error_events"
 WHERE "group_id" IS NOT NULL${scope}
 GROUP BY 1, 2, 3
@@ -102,43 +93,21 @@ ON CONFLICT ("project_id", "group_id", "hour") DO UPDATE
   SET "event_count" = EXCLUDED."event_count"
 `
 
-/**
- * ② 用户数：去重表里"每个 项目×问题×小时 新增了几张新面孔"。
- * ON CONFLICT 只更新 user_count，不动 event_count —— 这样 ①② 的先后顺序
- * 不影响结果，同一个桶被两条 INSERT 各写一半也能拼成完整的一行。
- */
-const INSERT_USER_COUNTS_SQL = `
-INSERT INTO "issue_stats_hourly" ("project_id", "group_id", "hour", "event_count", "user_count")
-SELECT
-  "project_id",
-  "group_id",
-  ${HOUR_SQL('first_seen')},
-  0,
-  count(*)::int
-FROM "affected_users"
-WHERE true${scope}
-GROUP BY 1, 2, 3
-ON CONFLICT ("project_id", "group_id", "hour") DO UPDATE
-  SET "user_count" = EXCLUDED."user_count"
-`
-
 /** 回填完（或回滚前）的体检：聚合总数 vs 明细总数 */
 const SUMMARY_SQL = `
 SELECT
   (SELECT count(*)::int FROM "issue_stats_hourly" WHERE true${scope})            AS stat_rows,
   (SELECT coalesce(sum("event_count"), 0)::int FROM "issue_stats_hourly" WHERE true${scope}) AS stat_events,
-  (SELECT coalesce(sum("user_count"), 0)::int FROM "issue_stats_hourly" WHERE true${scope})  AS stat_users,
   (SELECT min("hour") FROM "issue_stats_hourly" WHERE true${scope})              AS min_hour,
   (SELECT max("hour") FROM "issue_stats_hourly" WHERE true${scope})              AS max_hour,
-  (SELECT count(*)::int FROM "error_events" WHERE "group_id" IS NOT NULL${scope}) AS detail_events,
-  (SELECT count(*)::int FROM "affected_users" WHERE true${scope})                 AS detail_users
+  (SELECT count(*)::int FROM "error_events" WHERE "group_id" IS NOT NULL${scope}) AS detail_events
 `
 
 const fmt = (d) => (d instanceof Date ? d.toISOString() : String(d))
 
 async function main() {
   const startedAt = Date.now()
-  const written = { deleted: 0, events: 0, users: 0 }
+  const written = { deleted: 0, events: 0 }
   let summary = null
 
   console.log(
@@ -153,10 +122,6 @@ async function main() {
         written.deleted = await tx.$executeRawUnsafe(DELETE_SQL, ...params)
         written.events = await tx.$executeRawUnsafe(
           INSERT_EVENT_COUNTS_SQL,
-          ...params,
-        )
-        written.users = await tx.$executeRawUnsafe(
-          INSERT_USER_COUNTS_SQL,
           ...params,
         )
 
@@ -175,24 +140,21 @@ async function main() {
 
   const ms = Date.now() - startedAt
   const eventsOk = summary.stat_events === summary.detail_events
-  const usersOk = summary.stat_users === summary.detail_users
 
   console.log(
     [
       '',
       `  ${DRY_RUN ? '将删除' : '已删除'}   ${written.deleted} 行旧聚合`,
       `  ${DRY_RUN ? '将写入' : '已写入'}   ${written.events} 行事件计数（来自 error_events）`,
-      `  ${DRY_RUN ? '将写入' : '已写入'}   ${written.users} 行用户计数（来自 affected_users，可能落入已有桶）`,
       '',
       `  聚合表   ${summary.stat_rows} 行，时间范围 ${fmt(summary.min_hour)} ~ ${fmt(summary.max_hour)}`,
       `  事件数   sum(event_count) = ${summary.stat_events}  ｜  明细 ${summary.detail_events}  ${eventsOk ? '✓' : '✗'}`,
-      `  用户数   sum(user_count)  = ${summary.stat_users}  ｜  明细 ${summary.detail_users}  ${usersOk ? '✓' : '✗'}`,
       '',
       `  耗时 ${ms}ms${DRY_RUN ? '（已回滚，库里没有任何变化）' : ''}`,
     ].join('\n'),
   )
 
-  if (!eventsOk || !usersOk) {
+  if (!eventsOk) {
     console.error(
       '\n✗ 总数对不上。常见原因：明细里有 group_id 指向已删问题（不该发生，FK 会拦住），' +
         '或者期间的 B2 实时写入用了另一个小时截断规则。逐组核对：npm run stats:reconcile',

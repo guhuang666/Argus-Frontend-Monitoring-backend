@@ -30,16 +30,17 @@ import { PERF_METRICS, type PerfMetric } from './dto/performance-query.dto';
  * 犯的错，而且错得很隐蔽：榜单看上去永远有数据，只是永远不变。
  *
  * · byEvents = Σ issue_stats_hourly.event_count → "这段时间谁最吵"
- * · byUsers  = Σ issue_stats_hourly.user_count  → **"这段时间新增受影响用户"**
+ * · byUsers  = COUNT(affected_users) → **"这段时间新增受影响用户"**
  *
- * user_count 的判据是 `affected_users.first_seen` 落在哪个小时桶，一个人只会在
- * "首次被影响"的那个桶里计一次。所以窗口外首次、窗口内仍在报错的用户**不计入**。
- * 这是刻意的近似（精确口径需要一张按天去重的表），因此界面文案必须写
- * 「新增受影响用户」而不是「受影响用户」。
+ * 两个榜来自两张不同的表，各自按自己的时间列过滤窗口（同一事务，同一快照）：
+ *   · event_count 按事件时间（客户端时钟 `error_events.timestamp` → hour 桶）
+ *   · 用户数按首次影响时间（服务端时钟 `affected_users.first_seen`）
+ * 所以两条曲线不能逐桶相加，但各自的窗口总量都能与明细对账。
  *
- * 两个指标还用了不同的时钟：event_count 按事件时间（客户端时钟 timestamp），
- * user_count 按首次影响时间（服务端时钟）。所以两条曲线不能逐桶相加，
- * 但各自的窗口总量都能与明细对账。
+ * 用户数**直接查明细表**而不是读预聚合列：批次归并时 newUsers 是整批一个数，
+ * 没法按小时拆（issue_stats_hourly.user_count 已因此移除）。这里按 first_seen
+ * 落在窗口内计数，一个人只算一次，口径就是「新增受影响用户」——所以界面文案
+ * 必须写「新增受影响用户」而不是「受影响用户」。
  */
 @Injectable()
 export class StatsService {
@@ -318,19 +319,33 @@ export class StatsService {
     const column = Prisma.raw(orderBy === 'users' ? 'users' : 'events');
 
     return this.prisma.$queryRaw<TopRow[]>`
+      WITH ev AS (
+        SELECT group_id, SUM(event_count)::bigint AS events
+          FROM issue_stats_hourly
+         WHERE project_id = ${projectId}::uuid
+           AND hour >= ${from}
+           AND hour <  ${to}
+         GROUP BY group_id
+      ), us AS (
+        SELECT group_id, COUNT(*)::bigint AS users
+          FROM affected_users
+         WHERE project_id = ${projectId}::uuid
+           AND first_seen >= ${from}
+           AND first_seen <  ${to}
+         GROUP BY group_id
+      )
       SELECT g.id,
              g.title,
              g.culprit,
              g."level" AS level,
              g.status,
-             SUM(s.event_count)::bigint AS events,
-             SUM(s.user_count)::bigint  AS users
-        FROM issue_stats_hourly s
-        JOIN error_groups g ON g.id = s.group_id
-       WHERE s.project_id = ${projectId}::uuid
-         AND s.hour >= ${from}
-         AND s.hour <  ${to}
-       GROUP BY g.id, g.title, g.culprit, g."level", g.status
+             COALESCE(ev.events, 0) AS events,
+             COALESCE(us.users, 0)  AS users
+        FROM error_groups g
+        LEFT JOIN ev ON ev.group_id = g.id
+        LEFT JOIN us ON us.group_id = g.id
+       WHERE g.project_id = ${projectId}::uuid
+         AND (ev.events IS NOT NULL OR us.users IS NOT NULL)
        ORDER BY ${column} DESC, g.id
        LIMIT ${limit}
     `;

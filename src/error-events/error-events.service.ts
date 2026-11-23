@@ -96,7 +96,7 @@ export class ErrorEventsService {
    * 参数来自控制器从 `req.id` 取的请求 id（pino-http 生成或继承 x-request-id）。
    * 它的唯一用途是**跟着 job 进队列**，让 Worker 那行"已消费"日志能和
    * "这条上报来自哪次 HTTP 请求"对上 —— 跨进程排查一条事件时靠它串起来。
-   * 允许为 undefined：老客户端/老 job 没有它，日志里打 `-` 即可，不能因此报错。
+   * 允许为 undefined：老客户端没有它，日志里打 `-` 即可，不能因此报错。
    */
   async ingest(
     payload: IngestErrorDto,

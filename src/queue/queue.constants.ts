@@ -73,14 +73,9 @@ export interface ErrorEventJobData {
    * 单条上报也走这里（长度 1）—— 消费端只有一条代码路径，
    * 不必为"1 条"和"多条"各维护一套归并逻辑。
    *
-   * 可空仅为兼容：M7-T5 之前投递、仍在队列里的老 job 只有 `eventId`。
+   * 可空：job 载荷来自 Redis，可能是老数据或被写坏的值，读的时候用 `?? []` 兜底。
    */
   eventIds?: string[];
-  /**
-   * @deprecated 老 job 的单条载荷形状。**生产侧不再写入**，
-   * 只有消费侧用它兜住队列里在途的老 job，跑完这批就彻底没用了。
-   */
-  eventId?: string;
   /**
    * 产生这条 job 的 HTTP 请求 id（M6-6）。
    *
@@ -92,22 +87,10 @@ export interface ErrorEventJobData {
   requestId?: string;
 }
 
-/**
- * 从 job 载荷里取出要处理的事件主键，兼容新老两种形状。
- *
- * 单独成函数而不是散在处理器里：这是"新老载荷"唯一的接缝，
- * 集中在一处，老形状什么时候能删一眼可见。
- */
-export function jobEventIds(data: ErrorEventJobData | undefined): string[] {
-  if (data === undefined) return [];
-  if (Array.isArray(data.eventIds) && data.eventIds.length > 0) return data.eventIds;
-  // 兼容 M7-T5 之前投递的老 job
-  if (typeof data.eventId === 'string' && data.eventId !== '') return [data.eventId];
-  return [];
-}
-
 /** 死信载荷：原载荷 + 失败现场，够事后定位就行 */
 export interface ErrorEventDlqData extends ErrorEventJobData {
+  /** 代表 id：失败现场只留一个可读主键，便于日志里 grep */
+  eventId: string;
   /** 最后一次失败的原因（Error.message） */
   failedReason: string;
   /** 一共尝试了几次（等于 attempts，因为只有重试耗尽才会进 DLQ） */
