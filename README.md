@@ -14,7 +14,7 @@
 | 指纹归并 | 同一条错误归成一个「问题」，`times_seen` / `users_seen` 原子累加；状态流转让已解决的问题"回归"时自动重开 |
 | Sourcemap 符号化 | 上传 `.map` → 按 `(项目, release)` 匹配 → 还原出源码文件/行/列/函数名 + 上下文代码；拿不到就降级显示压缩位置，**绝不因此丢事件** |
 | 性能监控 | Web Vitals（LCP / CLS / INP）+ 分位数趋势（P50 / P75 / P95） |
-| 概览 | 错误趋势、问题数、新增问题、PV / UV / 错误率 |
+| 概览 | 错误趋势、问题数、新增问题、PV / UV / 错误率；两个 Top 问题榜（按次数 / 按新增受影响用户） |
 | 多租户 | 组织 / 项目 / 密钥；公钥只能写、私钥只能管，私钥只存哈希 |
 | 告警 | 规则 CRUD、每 60 秒评估、飞书 / Slack / 钉钉推送、静默期 + 触发历史 |
 | 可观测性 | `/health/live` 与 `/health/ready` 分离、Prometheus 指标、Grafana 面板、pino 结构化日志 |
@@ -227,7 +227,7 @@ GET    /metrics                       Prometheus 抓取（无 api/v1 前缀）
 | `error_events` | 一条原始上报（明细保留 30 天） | `processed_at IS NULL` 是归并的幂等闸门 |
 | `error_groups` | 一个「问题」 | `(project_id, grouping_version, fingerprint)` 唯一 |
 | `affected_users` | 去重表：谁被这个问题影响过 | 主键 `(项目, 问题, 用户)`，插入用 `ON CONFLICT DO NOTHING` |
-| `issue_stats_hourly` | 每小时 × 每个问题的次数 / 新增用户 | 主键 `(project_id, group_id, hour)`，`hour` 必须是 **UTC 整点** |
+| `issue_stats_hourly` | 每小时 × 每个问题的**事件次数** | 主键 `(project_id, group_id, hour)`，`hour` 必须是 **UTC 整点**；用户数**不**预聚合（见 §10.4） |
 | `sessions` | 一次页面会话 | `had_error` 是错误率的分子 |
 | `performance_metrics` | 一次页面加载的三个 Web Vitals | 三个指标都可空（"没测到" ≠ "测得 0"） |
 | `releases` / `sourcemap_files` | 版本与它的 `.map` 对应关系 | `(release_id, artifact_path)` 唯一 |
@@ -255,10 +255,11 @@ worker 侧还有一层 Redis 锁（`alert:evaluator:lock`），保证即使 work
 
 ## 10. 几个关键设计
 
-1. **归并幂等**：先 `UPDATE error_events SET processed_at = now() WHERE event_id = $1 AND processed_at IS NULL RETURNING ...`，抢到的那次才归并。队列语义是 at-least-once，重复消费必须无害。
+1. **归并幂等**：先 `UPDATE error_events SET processed_at = now() WHERE event_id IN (...) AND processed_at IS NULL RETURNING ...`，一条 SQL 抢整批；抢到的那些才归并。队列语义是 at-least-once，重复消费必须无害。
 2. **指纹带版本**：`v1-raw`（压缩位置）与 `v2-symbolicated`（源码位置）并存于唯一键。M3 上线时做一次受控重算，避免同一错误在符号化前后裂成两个问题。
 3. **计数一律用 `increment`**：`times_seen`、`users_seen`、`event_count` 都让数据库做加法。读改写会在并发下静默丢计数。
-4. **预聚合表 + 回填 + 对账**：趋势读 `issue_stats_hourly`（明细 30 天后就没了）；`stats:backfill` 可重跑，`stats:reconcile` 用 5 条恒等式校验。小时桶一律按 UTC 截断，**禁止 `date_trunc`**（它会跟着会话时区走）。
+4. **预聚合表 + 回填 + 对账**：趋势读 `issue_stats_hourly`（明细 30 天后就没了）；`stats:backfill` 可重跑，`stats:reconcile` 用 **4 条**恒等式校验。小时桶一律按 UTC 截断，**禁止 `date_trunc`**（它会跟着会话时区走）。
+   **表里只存事件数**：受影响用户数不预聚合 —— 批次归并时"新增用户"是整批一个数、拆不到小时，看板改为直接查 `affected_users.first_seen`（`/stats/overview` 的 `byUsers` 榜）。
 5. **列号 0/1-based 只在两处换算**：sourcemap 内部是 0-based，浏览器是 1-based；查表前 `-1`、展示时 `+1`，别的地方不要动。
 6. **符号化失败即降级**：没 release、没 map、map 坏了，都只让这一帧显示压缩位置；抛错会把整条事件推进 DLQ。
 7. **限流 fail-open**：Redis 挂了就放行并打日志。监控系统的第一职责是记录事实，为了限流丢掉上报是本末倒置。
@@ -275,6 +276,7 @@ npm run test:e2e      # e2e：真 PG + 真 Redis，跑在 ?schema=e2e
 ```
 
 - 单测覆盖：指纹与栈解析、符号化、限流判定、健康检查、统计接口、告警评估 / 投递、事件入库、密钥与会话。
+- ⚠ **归并 worker（`grouping/error-event.processor`）的单测仍在迁移到批量路径**：删掉单条处理路径后，那批用例还按老形状构造 job 载荷，目前是红的（`npm test` 会失败）。其余模块的单测不受影响；补测试时把 `jobLike()` 改成 `{ eventIds: [...] }` 并重录断言即可。
 - e2e 首次运行前要先给 e2e schema 建表：
 
 ```bash
