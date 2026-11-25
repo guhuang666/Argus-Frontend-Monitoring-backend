@@ -1,27 +1,33 @@
-# Argus 本地环境：PostgreSQL + Redis + api + worker + Prometheus + Grafana
+# Argus 环境编排：PostgreSQL + Redis + migrate + api + worker + web
+#
+# ⚠️ 本文件【只声明镜像，不做构建】—— 镜像必须先手动构建好：
+#   docker build -t argus-backend .                     （api / worker 共用）
+#   docker build --target migrate -t argus-migrate .    （一次性迁移容器）
+#   docker build -t argus-dashboard ../dashboard        （web）
+# 镜像缺失时 compose 会尝试 docker pull 并失败，【不会】自动构建 —— 这是有意的：
+# 云端部署没有源码和构建网络，宁可明确报错，也不要悄悄在服务器上跑 npm ci。
 #
 # 在 backend 目录执行：
-#   docker compose up -d                    拉起全部（含 api / worker 容器）
+#   docker compose up -d                    拉起全部
 #   docker compose up -d postgres redis     只起依赖（本机 npm run dev 时用）
 #   docker compose ps                       看状态
 #   docker compose logs -f api              看某个服务的日志
 #   docker compose down                     收工 —— 不要加 -v，加了会连数据卷一起删
 #
 # 端口一览：
+#   8080  web（宿主机 8080 → 容器内 80）
 #   3000  api（容器）
 #   5432  PostgreSQL
 #   6379  Redis
-#   9090  Prometheus（指标抓取与告警规则）
-#   3001  Grafana（admin / argus-grafana-2026）
 #
+# 平台自监控（Prometheus / Grafana）已移出本文件，原因见下方 services 末尾的注释。
 # 两种开发方式并存：
-#   · 容器化（M7-T6）：docker compose up -d api worker
+#   · 容器化：docker compose up -d api worker
 #   · 本机 node（更快、能断点）：docker compose up -d postgres redis，然后 npm run dev
 # ⚠️ 两者都占 3000 端口，不要同时开。
 #
-# 数据存放：PostgreSQL 的数据在具名卷 argus-pg-data 里，Prometheus 的在
-# argus-prometheus-data 里；容器删了它们还在，只有 down -v 才会真正删除。
-# sourcemap 落盘在 argus-uploads 卷里，api 与 worker 共用。
+# 数据存放：PostgreSQL 的数据在具名卷 argus-pg-data 里；容器删了它还在，
+# 只有 down -v 才会真正删除。sourcemap 落盘在 argus-uploads 卷里，api 与 worker 共用。
 
 # 项目名显式钉死为 argus。
 # 历史原因：本目录原名是中文（终极项目），Compose 取目录名做项目名时会被规整成
@@ -59,10 +65,13 @@ services:
   # 跑完退出（exited 0），api / worker 才启动 —— 迁移失败就别带病上线。
   # 它用的是 Dockerfile 的 migrate 阶段（保留 devDeps，含 prisma CLI），
   # 不进最终交付镜像。
+  #
+  # ⚠️ 只声明 image、不写 build：部署时镜像由外部提供（本地构建后 docker load，
+  #    或从镜像仓库 docker pull）。compose 只负责"用哪个镜像"，不负责"怎么构建"。
+  #    本地构建：docker build --target migrate -t argus-migrate .
+  #    （缺了 image 名就只剩 build 一条路，服务器上没有源码时必然失败）
   migrate:
-    build:
-      context: .
-      target: migrate
+    image: argus-migrate
     environment:
       DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=public
       # seed.cjs 用这两个建管理员账号；不传就用脚本里的默认值
@@ -72,11 +81,13 @@ services:
       postgres:
         condition: service_healthy
 
-  # api 与 worker 共用同一个镜像（同一个 Dockerfile），只靠 command 区分入口。
+  # api 与 worker 共用同一个镜像，只靠 command 区分入口。
   # 容器网络里互相访问用服务名 postgres / redis —— 不是 127.0.0.1。
+  #
+  # ⚠️ 只声明 image、不写 build（理由同 migrate，见上）。
+  #    本地构建：docker build -t argus-backend .
   api:
-    build: .
-    image: argus-backend
+    image: argus-backend:v1.0.1 
     environment:
       DATABASE_URL: postgresql://argus:argus@postgres:5432/argus?schema=public
       REDIS_HOST: redis
@@ -96,8 +107,8 @@ services:
         condition: service_started
 
   worker:
-    build: .
-    image: argus-backend
+    # 和 api 共用同一个镜像，此处不再声明 build
+    image: argus-backend:v1.0.1 
     # 同一个镜像，换入口：worker 只消费队列，没有 HTTP 端口
     command: ["node", "dist/src/worker.js"]
     environment:
@@ -126,48 +137,17 @@ services:
     depends_on:
       - api
 
-  # ── 平台自监控（M6-8）──────────────────────────────────────────────────
-  # Prometheus 的目标配置见 deploy/prometheus/prometheus.yml。
-  # 容器化之后 api / worker 也在同一网络里，target 可以从 host.docker.internal
-  # 改成服务名 api:3000（见该文件的下一步演进）。
-  prometheus:
-    # 钉版本：latest 哪天变了存储格式或配置项，排查成本远高于升级收益
-    image: prom/prometheus:v2.55.1
-    ports: ["9090:9090"]
-    volumes:
-      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./deploy/prometheus/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
-      # 指标历史落在这里：容器重建不丢。保留 15 天（见 command）
-      - prometheus-data:/prometheus
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=15d
-    # Windows / macOS 的 Docker Desktop 自带 host.docker.internal；
-    # Linux 必须显式映射这一行，否则容器里解析不到"宿主机"
-    extra_hosts:
-      - 'host.docker.internal:host-gateway'
+  # ── 平台自监控（M6-8）已移出本文件 ─────────────────────────────────────
+  # Prometheus / Grafana 只在本地开发时看指标用；云端部署不传这两个镜像，
+  # 所以不放进这份 compose —— 否则 docker compose up 会去 Docker Hub 拉
+  # prom/prometheus 与 grafana/grafana，网络不好时会卡在那里。
+  #
+  # 代价：云端没有指标面板。api 的 /metrics 端点仍在，将来要接自建监控
+  # 时直接从容器网络抓 api:3000/metrics 即可（见 deploy/prometheus/prometheus.yml）。
+  #
+  # 配置文件（prometheus.yml / alert-rules.yml / grafana provisioning）都还
+  # 留在 deploy/ 下没删；本地想看图就把这两段从 git 历史里恢复出来单独跑。
 
-  grafana:
-    image: grafana/grafana:11.3.0
-    # 宿主机 3001 → 容器 3000（3000 已被 API 占用）
-    ports: ["3001:3000"]
-    depends_on:
-      - prometheus
-    environment:
-      # 开发凭据，与 backend/.env 的 ADMIN_* 一样只用于本机
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: argus-grafana-2026
-      GF_USERS_ALLOW_SIGN_UP: 'false'
-      # 关掉匿名统计与更新检查：离线环境启动更快，也不往外发数据
-      GF_ANALYTICS_REPORTING_ENABLED: 'false'
-      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
-    volumes:
-      # 数据源 + 面板全部 provisioning 自动配置 ——
-      # "docker compose up 就能看到图"，不需要在界面上手点一遍
-      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - grafana-data:/var/lib/grafana
 
 volumes:
   pg-data:
@@ -180,11 +160,5 @@ volumes:
   uploads:
     name: argus-uploads
 
-  # 指标历史：容器重建/重启都不丢，只有 docker compose down -v 才会清
-  prometheus-data:
-    name: argus-prometheus-data
+  # 注：prometheus-data / grafana-data 已随自监控一起移出本文件
 
-  # Grafana 自己的库（用户、偏好、面板编辑历史）。面板本身来自 provisioning，
-  # 所以这个卷丢了也不影响"面板还能不能导入"
-  grafana-data:
-    name: argus-grafana-data

@@ -1,0 +1,181 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Argus · 云端服务器部署编排
+# ═══════════════════════════════════════════════════════════════════════════
+# 这是在 docker-compose.yml 基础上派生的**服务器专用**版本，原文件保持不动。
+#
+# ── 与 docker-compose.yml 的四处差异 ──────────────────────────────────────
+#   ① 所有 image 指向阿里云 ACR 的【专有网络(VPC)地址】—— 走内网，快且不计外网流量费
+#   ② postgres / redis 的端口只绑 127.0.0.1，不对公网暴露
+#      （需要连库调试时用 ssh 隧道：ssh -L 5432:127.0.0.1:5432 root@服务器IP）
+#   ③ 所有服务加 restart: unless-stopped —— 服务器重启后自动拉起
+#   ④ 所有服务加日志轮转 —— 防止日志涨满磁盘（这是"跑了一个月突然全挂"的常见原因）
+#
+# ── 使用前提（三条都满足才能起来）─────────────────────────────────────────
+#   1) 服务器已登录过 ACR 的 VPC 地址：
+#        docker login --username=<账号> \
+#          crpi-sww88x5d9p8jwz1v-vpc.cn-shenzhen.personal.cr.aliyuncs.com
+#   2) 5 个镜像已拉到本地（docker images | grep crpi- 能看到 5 条）
+#   3) 本目录下有 .env，至少包含 JWT_SECRET。
+#      没有它的话 JWT 会用空密钥签发，任何人都能伪造登录态。
+#
+#        cat > .env <<'EOF'
+#        JWT_SECRET=<用 openssl rand -hex 32 生成>
+#        POSTGRES_PASSWORD=<强口令>
+#        ADMIN_EMAIL=you@example.com
+#        ADMIN_PASSWORD=<强口令>
+#        EOF
+#
+#      ⚠️ 若 POSTGRES_PASSWORD 含 @ : / ? # 等字符，写进 DATABASE_URL 时
+#         需要 URL 编码，否则连接串会被截断。最简单是只用字母数字和下划线。
+#
+# ── 启动与运维 ────────────────────────────────────────────────────────────
+#   docker compose -f docker-compose.server.yml up -d --pull never
+#   docker compose -f docker-compose.server.yml ps
+#   docker compose -f docker-compose.server.yml logs -f api
+#   docker compose -f docker-compose.server.yml down        ← 不要加 -v
+#
+# ⚠️ down 加 -v 会连 argus-pg-data 卷一起删 —— 数据库直接清零。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 项目名钉死为 argus：容器名（如 argus-postgres-1）、网络名都由它派生。
+# 改这里会让 compose 认不出已有的容器，进而重建它们。
+name: argus
+
+# 日志轮转模板，被下面每个服务用 `logging: *default-logging` 引用。
+# 不配的话 json-file 默认无上限，日志会一路涨到把磁盘写满。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: crpi-sww88x5d9p8jwz1v-vpc.cn-shenzhen.personal.cr.aliyuncs.com/argus-guhuang/argus-aliyun-registry:postgres-16-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: argus
+      POSTGRES_USER: argus
+      # 从 .env 读；.env 没定义时退回 argus（与开发环境一致，便于直接跑通）
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-argus}
+    # ⚠️ 只绑 127.0.0.1：公网访问不到，需要调试时用 ssh -L 隧道。
+    #    绝不能写成 "5432:5432" —— 那等于把数据库直接挂到公网上。
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    # api / worker 用 depends_on 的 service_healthy 等它就绪。
+    # 少了这条 healthcheck，compose 会直接报 "dependency has no healthcheck"。
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U argus -d argus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: crpi-sww88x5d9p8jwz1v-vpc.cn-shenzhen.personal.cr.aliyuncs.com/argus-guhuang/argus-aliyun-registry:redis-7-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    # 只绑本机，理由同 postgres。
+    # ⚠️ 未挂卷、未开 AOF：重启后队列数据会丢。
+    #    影响面：已入库但还没被归并的事件，processed_at 仍是 NULL，
+    #    等 worker 恢复后靠补扫任务捞回（该任务尚未实现，属于已知缺口）。
+    ports: ["127.0.0.1:6379:6379"]
+
+  # ── 一次性迁移容器 ─────────────────────────────────────────────────────
+  # 跑 `prisma migrate deploy && node scripts/seed.cjs`，跑完退出（exited 0），
+  # api / worker 才启动 —— 迁移失败就别带病上线。
+  #
+  # ⚠️ 注意：每次 up 都会把这个容器重新启动一次，也就是 seed 会重复执行。
+  #    seed 若不幂等（比如会重置管理员密码），每次部署都会被改回去。
+  #
+  # ⚠️ 它不在 api 的镜像里：migrate 阶段保留 devDeps 与 prisma CLI，体积 1.5GB，
+  #    只在这一个一次性容器里用，不能塞进常驻的 api 镜像。
+  migrate:
+    image: crpi-sww88x5d9p8jwz1v-vpc.cn-shenzhen.personal.cr.aliyuncs.com/argus-guhuang/argus-aliyun-registry:v1.0.1-migrate
+    restart: "no"
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql://argus:${POSTGRES_PASSWORD:-argus}@postgres:5432/argus?schema=public
+      # seed.cjs 用这两个建管理员账号；不传就用脚本里的默认值
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@argus.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-argus-admin-2026}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── API ────────────────────────────────────────────────────────────────
+  # 与 worker 共用同一个镜像，只靠 command 区分入口。
+  # 容器之间互相访问用服务名 postgres / redis —— 不是 127.0.0.1。
+  api:
+    image: crpi-sww88x5d9p8jwz1v-vpc.cn-shenzhen.personal.cr.aliyuncs.com/argus-guhuang/argus-aliyun-registry:v1.0.1-backend
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql://argus:${POSTGRES_PASSWORD:-argus}@postgres:5432/argus?schema=public
+      REDIS_HOST: redis
+      # .env 里必须有 JWT_SECRET；缺失时 Compose 会替换成空串 →
+      # JWT 用空密钥签发 → 任何人都能伪造登录态。启动前务必确认非空。
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 未设置，请先在 .env 里配置}
+      PORT: "3000"
+    # SDK / 看板都应该走 web 的 8080 反代（/api/ → api:3000）。
+    # 这里保留 3000 只是为了调试方便（如 curl /api/v1/health/live）。
+    # 等 HTTPS 上线、确认 8080 反代稳定后，可以删掉这行减少暴露面。
+    ports: ["3000:3000"]
+    volumes:
+      # sourcemap 落盘要放在容器可写层之外，否则重建容器就丢
+      - uploads:/app/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker:
+    image: crpi-sww88x5d9p8jwz1v-vpc.cn-shenzhen.personal.cr.aliyuncs.com/argus-guhuang/argus-aliyun-registry:v1.0.1-backend
+    restart: unless-stopped
+    logging: *default-logging
+    # 同一个镜像，换入口：worker 只消费队列，没有 HTTP 端口
+    command: ["node", "dist/src/worker.js"]
+    environment:
+      DATABASE_URL: postgresql://argus:${POSTGRES_PASSWORD:-argus}@postgres:5432/argus?schema=public
+      REDIS_HOST: redis
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 未设置，请先在 .env 里配置}
+    volumes:
+      # 必须和 api 共用同一个卷：worker 要读 api 上传的 .map
+      - uploads:/app/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # ── 前端（nginx 托管静态文件 + /api/ 反代）──────────────────────────────
+  # 浏览器看到的所有请求都发给同一个地址 → 不存在跨域问题。
+  web:
+    image: crpi-sww88x5d9p8jwz1v-vpc.cn-shenzhen.personal.cr.aliyuncs.com/argus-guhuang/argus-aliyun-registry:v1.0.1-dashboard
+    restart: unless-stopped
+    logging: *default-logging
+    # 宿主机 8080 → 容器内 80（避开 api 占用的 3000）
+    # 备案通过、Caddy/Nginx 上 HTTPS 之后，这里会变成纯内部端口。
+    ports: ["8080:80"]
+    depends_on:
+      - api
+
+  # ── 平台自监控未包含在本文件 ───────────────────────────────────────────
+  # Prometheus / Grafana 只在本地开发时看指标；云端不跑（省内存、省两个镜像下载）。
+  # api 的 /metrics 端点仍然存在，将来要接自建监控时从容器网络抓 api:3000/metrics。
+  # 配置文件保留在 deploy/prometheus/ 与 deploy/grafana/ 下。
+
+volumes:
+  # 卷名钉死：不写 name 的话实际卷名会是「项目名_卷名」，一旦改项目名/目录名
+  # Docker 就会建一个全新的空卷 —— 看起来像数据丢了。
+  pg-data:
+    name: argus-pg-data
+
+  # sourcemap 落盘目录。api 写、worker 读，重建容器不丢。
+  uploads:
+    name: argus-uploads
