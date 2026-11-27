@@ -466,11 +466,11 @@ export class ErrorEventProcessor {
   /**
    * 没抢到声明时，查清楚是哪一种情况再记日志（重复投递是正常现象，不该刷 error）。
    *
-   * ⚠️ 这里仍然只按 `eventId` 单列查。等 `error_events` 真的改成复合主键
-   * `(event_id, timestamp)` 后，Prisma 的 `where` 必须换成
-   * `{ eventId_timestamp: { eventId, timestamp } }`，否则**编译期**就过不去。
-   * 现在 schema 还是单列 `@id`，所以先保持单列；这段只在"整批都没抢到"的
-   * 诊断路径上跑，不在热路径。
+   * 定位必须带齐 `(eventId, timestamp)`：error_events 的主键是复合的，而且按
+   * timestamp 分区 —— 只给 eventId 既拿不到唯一一行（同一条事件理论上可能落在
+   * 不同日期的分区里），Prisma 的类型也不允许（唯一键字段名是 eventId_timestamp）。
+   *
+   * 这段只在"整批都没抢到"的诊断路径上跑，不在热路径。
    */
   private async explainUnclaimed(
     ref: ErrorEventRef,
@@ -478,7 +478,12 @@ export class ErrorEventProcessor {
   ): Promise<void> {
     const eventId = ref.eventId;
     const row = await this.prisma.errorEvent.findUnique({
-      where: { eventId },
+      where: {
+        // 复合主键在 Prisma 里的写法：字段名是 `key1_key2`。
+        // ref.timestamp 是入队时写入的 ISO 串，转回 Date 与原值毫秒级完全相等
+        // （JS Date 本来就只到毫秒，写库的也是这个值）。
+        eventId_timestamp: { eventId, timestamp: new Date(ref.timestamp) },
+      },
       select: { processedAt: true },
     });
 

@@ -482,7 +482,7 @@ model IssueStatHourly {
 model ErrorEvent {
   /// SDK 生成的事件唯一 ID，用于重复上报去重。
   /// 用 VarChar 而非 Uuid：DTO 只校验长度（1~128），SDK 发什么形状都收得下
-  eventId String @id @map("event_id") @db.VarChar(128)
+  eventId String  @map("event_id") @db.VarChar(128)
 
   /// 所属项目（S0 多租户）。NOT NULL：不知道归属的落库事件无法做鉴权隔离
   projectId String @map("project_id") @db.Uuid
@@ -585,8 +585,18 @@ model ErrorEvent {
   /// 注意：这是**内部字段**，不是给用户看的"已读"标记，不要拿它过滤读接口。
   processedAt DateTime? @map("processed_at") @db.Timestamptz
 
+  /// 主键是**复合的** `(event_id, timestamp)`，不是单列 event_id。
+  ///
+  /// 这是 PostgreSQL 分区表的硬规定：唯一约束/主键必须包含分区键。因为唯一性
+  /// 检查只能在单个分区内做，不带上分区键就无法保证全局唯一（同一 event_id
+  /// 可能落在不同日期的分区里）。
+  ///
+  /// 代价：event_id 单独不再全局唯一，去重从"数据库强保证"降级为"同一天内唯一"。
+  @@id([eventId, timestamp])
+
   /// 看板查询：某项目某时间段内的事件列表（TC-08：project_id 打头）
   @@index([projectId, timestamp(sort: Desc)])
+
   @@map("error_events")
 }
 
