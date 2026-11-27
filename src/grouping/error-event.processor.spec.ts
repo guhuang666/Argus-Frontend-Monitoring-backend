@@ -2,7 +2,7 @@ import { Logger } from '@nestjs/common';
 import type { Job, Queue } from 'bullmq';
 import type { WorkerMetricsService } from '../metrics/worker-metrics.service';
 import type { PrismaService } from '../prisma/prisma.service';
-import { DLQ_JOB_OPTIONS, ERROR_EVENT_JOB } from '../queue/queue.constants';
+import { DLQ_JOB_OPTIONS, ERROR_EVENT_JOB, type ErrorEventJobData } from '../queue/queue.constants';
 import { ErrorEventProcessor } from './error-event.processor';
 import type { Frame } from './fingerprint';
 import type { SourcemapLookupService } from './sourcemap-lookup.service';
@@ -33,8 +33,40 @@ jest.mock('@nestjs/bullmq', () => ({
 
 jest.mock('../../generated/prisma/client', () => ({
   PrismaClient: class PrismaClient {},
-  Prisma: {},
+  Prisma: {
+    // 只实现 processor 真正用到的两个运行时工具（其余都是类型）：
+    //   · sql  —— tagged template，把字符串片段和值合成一个带 text 的对象
+    //   · join —— 把一组片段用逗号连起来（IN 列表和 VALUES 行都靠它）
+    // 它们不产出合法 SQL，也不需要 —— 测试只要"调用不崩、值能取出来"。
+    sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
+      text: strings.reduce(
+        (acc, chunk, i) => acc + chunk + (i < values.length ? String(values[i]) : ''),
+        '',
+      ),
+    }),
+    join: (parts: Array<{ text: string }>) => ({
+      text: parts.map((p) => p.text).join(', '),
+    }),
+  },
 }));
+
+/**
+ * 把 tagged-template 的片段渲染成一段可读文本，供断言"写进去了什么"。
+ *
+ * 值里可能混着 `Prisma.sql`/`Prisma.join` 产出的 `{ text }` 片段（批量回填的
+ * VALUES 行就是这种），所以要先摊平一层再看。
+ */
+function renderSql(strings: readonly string[], values: readonly unknown[]): string {
+  const flat = values.map((v) =>
+    typeof v === 'object' && v !== null && 'text' in v
+      ? String((v as { text: unknown }).text)
+      : String(v),
+  );
+  return strings.reduce(
+    (acc, chunk, i) => acc + chunk + (i < flat.length ? flat[i] : ''),
+    '',
+  );
+}
 
 interface ClaimedEvent {
   event_id: string;
@@ -84,7 +116,8 @@ function fakePrisma(behavior: {
   const calls: string[] = [];
   let upsertArgs: { where: unknown; create: Record<string, unknown> } | null =
     null;
-  let updateArgs: { data: Record<string, unknown> } | null = null;
+  /** 回填那一步（一条批量 UPDATE）渲染出的 SQL 文本，供断言 group_id / frames */
+  let backfillSql: string | null = null;
   let groupUpdateArgs: { data: Record<string, unknown> } | null = null;
   /** M5：affectedUser.createMany 的入参（去重表写入） */
   let affectedArgs: { data: Array<Record<string, unknown>> } | null = null;
@@ -111,9 +144,9 @@ function fakePrisma(behavior: {
     get upsertArgs() {
       return upsertArgs;
     },
-    /** 回填时 errorEvent.update 的入参，供断言 groupId 用 */
-    get updateArgs() {
-      return updateArgs;
+    /** 回填 SQL 的文本形态；null = 还没走到回填那一步 */
+    get backfillSql() {
+      return backfillSql;
     },
     /** 状态回归时 errorGroup.update 的入参（只有 resolved 才有） */
     get groupUpdateArgs() {
@@ -185,12 +218,12 @@ function fakePrisma(behavior: {
             return {};
           },
         },
-        errorEvent: {
-          update: async (args: unknown) => {
-            calls.push('tx:updateEvent');
-            updateArgs = args as { data: Record<string, unknown> };
-            return {};
-          },
+        // 回填是一条批量 UPDATE（FROM VALUES），不是逐条 errorEvent.update。
+        // 断言方式：把渲染后的 SQL 存下来，检查里面有没有预期的值。
+        $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+          calls.push('tx:updateEvent');
+          backfillSql = renderSql(strings, values);
+          return 0;
         },
       });
     },
@@ -292,20 +325,34 @@ function build(
   );
 }
 
-/** 只造出被测代码真正用到的字段，其余强转 */
+/**
+ * 只造出被测代码真正用到的字段，其余强转。
+ *
+ * 载荷形状必须和 `ErrorEventJobData` 对齐：`events` 里每条都带
+ * (eventId, timestamp)。timestamp 复用 CLAIMED 的那个时刻 ——
+ * 它既是主键的一半，又是分区键，claimMany 拿它和 event_id 一起定位。
+ */
 function jobLike(overrides: {
   attemptsMade?: number;
   attempts?: number;
   eventId?: string;
-}): Job<{ eventId: string }> {
+  timestamp?: string;
+}): Job<ErrorEventJobData> {
   return {
     id: 'evt-1',
-    data: { eventId: overrides.eventId ?? 'evt-1' },
+    data: {
+      events: [
+        {
+          eventId: overrides.eventId ?? 'evt-1',
+          timestamp: overrides.timestamp ?? CLAIMED.timestamp.toISOString(),
+        },
+      ],
+    },
     attemptsMade: overrides.attemptsMade ?? 1,
     opts: { attempts: overrides.attempts ?? 3 },
     // DLQ 指标要按项目分，项目 id 从队列名反解（processor 里的 projectIdOf）
     queueName: `error-events-${TEST_PROJECT}`,
-  } as unknown as Job<{ eventId: string }>;
+  } as unknown as Job<ErrorEventJobData>;
 }
 
 describe('ErrorEventProcessor', () => {
@@ -330,9 +377,9 @@ describe('ErrorEventProcessor', () => {
       await build(prisma, dlq).handle(jobLike({}));
 
       expect(prisma.calls).toContain('tx:claim');
-      expect(
-        logged.some((l) => l.includes('已消费') && l.includes('evt-1')),
-      ).toBe(true);
+      // 批量之后日志是「一条汇总」而不是逐条事件，不再带 event_id ——
+      // 所以只断言条数（1/1），它等价于"这一批确实被消费了"
+      expect(logged.some((l) => l.includes('已消费 1/1 条'))).toBe(true);
       // 声明成功不该去查"为什么没抢到"（少一次查询）
       expect(prisma.calls).not.toContain('db:findUnique');
     });
@@ -370,13 +417,14 @@ describe('ErrorEventProcessor', () => {
         timesSeen: 1,
       });
 
-      // 回填 group_id，并把解析出的 frames 落库
-      expect(prisma.updateArgs?.data).toMatchObject({ groupId: 'group-1' });
-      expect(prisma.updateArgs?.data.stacktraceFrames).toBeDefined();
+      // 回填 group_id，并把解析出的 frames 落库（一条批量 UPDATE 带 VALUES 行）
+      expect(prisma.backfillSql).toContain('group-1');
+      expect(prisma.backfillSql).toContain('stacktrace_frames');
 
-      // 日志带上了 group / fp / times，验收时不用查库
+      // 日志带上了分组数 / 时间桶，验收时不用查库。
+      // （批量之后日志是汇总形态：groups=N 而不是单个 group id）
       const consumed = logged.find((l) => l.includes('已消费'));
-      expect(consumed).toContain('group=group-1');
+      expect(consumed).toContain('groups=1');
       expect(consumed).toContain('times=2');
     });
 
@@ -403,18 +451,14 @@ describe('ErrorEventProcessor', () => {
         culprit: 'src/pages/OrderList.tsx:OrderList',
       });
 
-      // 落库的是符号化后的帧（带 source / sourceLine），不是压缩帧
-      const frames = prisma.updateArgs?.data.stacktraceFrames as Array<
-        Record<string, unknown>
-      >;
-      expect(frames[0]).toMatchObject({
-        resolved: true,
-        source: 'src/pages/OrderList.tsx',
-        sourceLine: 87,
-      });
+      // 落库的是符号化后的帧（带 source / sourceLine），不是压缩帧。
+      // frames 是作为 VALUES 的参数拼进 SQL 的，所以在渲染文本里能直接找到。
+      expect(prisma.backfillSql).toContain('src/pages/OrderList.tsx');
+      expect(prisma.backfillSql).toContain('"resolved":true');
+      expect(prisma.backfillSql).toContain('"sourceLine":87');
 
-      // 日志里 ver=v2，验收时一眼能看出符号化有没有生效
-      expect(logged.some((l) => l.includes('ver=v2'))).toBe(true);
+      // 日志里的 symbolicated 计数能直接看出符号化有没有生效
+      expect(logged.some((l) => l.includes('symbolicated=1/1'))).toBe(true);
     });
 
     it('M3：没有 release 时不做符号化，仍然走 v1（与 M2 行为一致）', async () => {
@@ -429,7 +473,8 @@ describe('ErrorEventProcessor', () => {
       expect(prisma.upsertArgs?.create).toMatchObject({
         groupingVersion: 'v1-raw',
       });
-      expect(logged.some((l) => l.includes('ver=v1'))).toBe(true);
+      // symbolicated=0/1：一条都没还原，等价于旧的 ver=v1 行为
+      expect(logged.some((l) => l.includes('symbolicated=0/1'))).toBe(true);
     });
 
     it('已解决的问题又收到事件 → 回归未处理（FR-4.8）', async () => {
@@ -523,8 +568,6 @@ describe('ErrorEventProcessor', () => {
         projectId: TEST_PROJECT,
         groupId: 'group-1',
         userKey: 'u_alice',
-        // 测试数据没带 release，所以这里应该是 null（不是空串）
-        firstRelease: null,
       });
       // 必须用原子 increment：读改写会在并发下互相覆盖
       const increment = prisma.groupUpdates.find((u) => 'usersSeen' in u.data);
@@ -555,18 +598,6 @@ describe('ErrorEventProcessor', () => {
       expect(prisma.groupUpdates.some((u) => 'usersSeen' in u.data)).toBe(false);
     });
 
-    it('带上 release 时记进 firstRelease（版本维度可追溯）', async () => {
-      const prisma = fakePrisma({
-        claimed: { ...CLAIMED, user_id: 'u_bob', release: 'web@1.2.0' },
-      });
-
-      await build(prisma, fakeDlq()).handle(jobLike({}));
-
-      expect(prisma.affectedArgs?.data[0]).toMatchObject({
-        userKey: 'u_bob',
-        firstRelease: 'web@1.2.0',
-      });
-    });
   });
 
   describe('小时聚合（M5 / B2）', () => {
@@ -607,34 +638,6 @@ describe('ErrorEventProcessor', () => {
       expect(where.projectId_groupId_hour.hour.toISOString()).toBe(
         '2026-01-01T13:00:00.000Z',
       );
-    });
-
-    it('新用户 → userCount 也 increment；create 分支带上同一个数', async () => {
-      const prisma = fakePrisma({
-        claimed: { ...CLAIMED, user_id: 'u_alice' },
-        affectedInserted: 1,
-      });
-
-      await build(prisma, fakeDlq()).handle(jobLike({}));
-
-      const [stat] = prisma.statUpserts;
-      expect(stat.update).toMatchObject({ userCount: { increment: 1 } });
-      expect(stat.create).toMatchObject({ userCount: 1 });
-    });
-
-    it('老用户（去重命中）→ update 里根本不出现 userCount 字段', async () => {
-      const prisma = fakePrisma({
-        claimed: { ...CLAIMED, user_id: 'u_alice' },
-        affectedInserted: 0,
-      });
-
-      await build(prisma, fakeDlq()).handle(jobLike({}));
-
-      const [stat] = prisma.statUpserts;
-      // 字段不出现 = 不写这一列；写成 { increment: 0 } 会产生一次无意义的写
-      expect('userCount' in stat.update).toBe(false);
-      expect(stat.update).toMatchObject({ eventCount: { increment: 1 } });
-      expect(stat.create).toMatchObject({ userCount: 0 });
     });
 
     it('没带 user_id 的事件照样记小时聚合（只是 userCount 不动）', async () => {

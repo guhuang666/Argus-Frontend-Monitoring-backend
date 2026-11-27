@@ -25,6 +25,16 @@ export interface BatchIngestResult {
   duplicates: number;
 }
 
+/**
+ * `toRow` 的产出类型。这里只把 `timestamp` 收窄成确定的 `Date`，理由很实在：
+ * 它既是主键的一半，又是分区键 —— 入库和入队必须用**同一个值**。
+ * 如果两处各算一次 `new Date()`（SDK 没带 timestamp 时就是 now()），
+ * 队列里的坐标就会对不上库里那一行，Worker 永远抢不到这条事件。
+ */
+type ErrorEventRow = Prisma.ErrorEventUncheckedCreateInput & {
+  timestamp: Date;
+};
+
 @Injectable()
 export class ErrorEventsService {
   private readonly logger = new Logger(ErrorEventsService.name);
@@ -105,8 +115,13 @@ export class ErrorEventsService {
   ): Promise<IngestResult> {
     this.logIncoming(payload, requestId);
 
+    // 入库与入队必须用**同一份** timestamp：它既是主键的一半，又是分区键。
+    // 两处各算一次 `new Date()`（SDK 没带 timestamp 时就是 now()）会让队列里的
+    // 坐标对不上库里那一行，Worker 就永远抢不到这条事件。
+    const row = this.toRow(payload, projectId);
+
     try {
-      await this.prisma.errorEvent.create({ data: this.toRow(payload, projectId) });
+      await this.prisma.errorEvent.create({ data: row });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError) {
         // event_id 就是主键，所以撞唯一约束只可能是"这条事件重复上报"
@@ -140,7 +155,11 @@ export class ErrorEventsService {
 
     // 长度 1 也走批量路径：消费端只有 claimMany 一条代码路径，
     // 不必为"1 条"和"多条"各维护一套归并逻辑
-    await this.enqueueMany([payload.event_id], projectId, requestId);
+    await this.enqueueMany(
+      [{ eventId: row.eventId, timestamp: row.timestamp }],
+      projectId,
+      requestId,
+    );
 
     return { event_id: payload.event_id, duplicate: false };
   }
@@ -173,18 +192,18 @@ export class ErrorEventsService {
       data: rows,
       // → ON CONFLICT DO NOTHING：撞 event_id 主键就跳过，不抛错
       skipDuplicates: true,
-      select: { eventId: true },
+      // timestamp 也要取回来：它是分区键，入队时得一起带上（见 enqueueMany）。
+      // 取 DB 里的真实值而不是 rows 里那份，避免"写进去的和带出去的不是同一个数"。
+      select: { eventId: true, timestamp: true },
     });
 
     // 指标按"批"记一次（MVP）。注意这会低估事件数，见文档里的改进项
     this.metrics.recordIngest(projectId);
 
     await this.touchSessions(events, projectId);
-    await this.enqueueMany(
-      inserted.map((row) => row.eventId),
-      projectId,
-      requestId,
-    );
+    // inserted 里的每一行都带着 (eventId, timestamp) —— 正是 Worker 定位所需
+    // 的完整坐标，不需要再回表或重新推算时间
+    await this.enqueueMany(inserted, projectId, requestId);
 
     return { accepted: inserted.length, duplicates: rows.length - inserted.length };
   }
@@ -218,17 +237,17 @@ export class ErrorEventsService {
   }
 
   /**
-   * 投递归并任务：**一个 job 带整批主键**，只占一次 Redis 往返。
+   * 投递归并任务：**一个 job 带整批事件坐标**，只占一次 Redis 往返。
    *
-   * 单条上报调用时传 `[eventId]`（长度 1），批量上报传整批（最多 50）。
-   * 两条路径共用这一个方法 —— 此前还有一个只收单个 id 的 `enqueue()`，
-   * 它与 `enqueueMany([id])` 逐行等价（连 jobId 都是 `toJobId(eventIds[0])`），
-   * 留着只会让"改一处忘另一处"有机会发生，已合并。
+   * 单条上报传长度 1 的数组，批量上报传整批（最多 50）。两条路径共用这一个方法
+   * —— 此前还有一个只收单个 id 的 `enqueue()`，它与 `enqueueMany([id])` 逐行
+   * 等价（连 jobId 都是 `toJobId(events[0].eventId)`），留着只会让"改一处忘
+   * 另一处"有机会发生，已合并。
    *
    * ── M7-T5 起为什么不投 N 个 job ────────────────────────────────────────
    * 投 N 个 job 只是让"入队"变快，消费端仍然逐条处理，而消费端每个事件要写
    * 4~5 条 SQL（其中 2 条打在同一行 error_groups）。真正省时间的是让消费端
-   * 一次性拿到 N 个主键 —— 归并时 times_seen 一次 += N。
+   * 一次性拿到 N 条坐标 —— 归并时 times_seen 一次 += N。
    * 实测：逐条消费 ≈63 events/s → 批量 ≈688 events/s（见 bench/压测报告.md §14）。
    *
    * ── jobId 用第一个主键 ────────────────────────────────────────────────
@@ -249,31 +268,40 @@ export class ErrorEventsService {
    * 补扫会按 processed_at IS NULL 把它捞回来。
    *
    * ── requestId 进 job.data ──────────────────────────────────────────────
-   * job.data 里本来就只带主键（见 queue.constants 的"只带主键"约定），
+   * job.data 里本来就只带坐标（见 queue.constants 的 ErrorEventRef），
    * requestId 是**唯一**的例外：它不是业务数据、不落库、只出现在日志里，
    * 但它是跨进程串联的唯一线索，丢了就再也补不回来（Worker 拿不到 HTTP 上下文）。
    * 值为 undefined 时按 BullMQ 的行为会被序列化丢掉，Worker 侧按"没有"处理。
    */
   private async enqueueMany(
-    eventIds: string[],
+    events: Array<{ eventId: string; timestamp: Date }>,
     projectId: string,
     requestId?: string,
   ): Promise<void> {
-    if (eventIds.length === 0) return;
+    if (events.length === 0) return;
 
     try {
       await this.queues.queueFor(projectId).add(
         ERROR_EVENT_JOB,
-        { eventIds, requestId },
-        { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(eventIds[0]) },
+        {
+          // Date → ISO 字符串：Redis 里只放可序列化的原始值。
+          // 为什么不在这里顺手重算时间 —— timestamp 是分区键，
+          // 它必须和库里那一行**完全相等**，否则 Worker 定位不到（见 ErrorEventRef）
+          events: events.map((e) => ({
+            eventId: e.eventId,
+            timestamp: e.timestamp.toISOString(),
+          })),
+          requestId,
+        },
+        { ...ERROR_EVENT_JOB_OPTIONS, jobId: toJobId(events[0].eventId) },
       );
     } catch (err) {
       // 日志里保留**首条** event_id：单条上报时它就是那条事件的花名册；
       // 批量时给出总数 + 一个可 grep 的代表，不需要把 50 个 id 全打出来。
       this.logger.error(
-        `入队失败，${eventIds.length} 条已入库但尚未归并（等补扫兜住）: ` +
-          `event_id=${eventIds[0]}` +
-          (eventIds.length > 1 ? ` 等 ${eventIds.length} 条` : '') +
+        `入队失败，${events.length} 条已入库但尚未归并（等补扫兜住）: ` +
+          `event_id=${events[0].eventId}` +
+          (events.length > 1 ? ` 等 ${events.length} 条` : '') +
           ` project=${projectId} requestId=${requestId ?? '-'} 原因=${String(err)}`,
       );
     }
@@ -289,7 +317,7 @@ export class ErrorEventsService {
    * 缺值统一落 null 而不是 ''：列可空，"SDK 没发这个字段"和"发了个空串"是两件事，
    * 用空串兜底会把后者的信息也抹掉。
    */
-  private toRow(payload: IngestErrorDto, projectId: string): Prisma.ErrorEventUncheckedCreateInput {
+  private toRow(payload: IngestErrorDto, projectId: string): ErrorEventRow {
     return {
       eventId: payload.event_id,
       // 所属项目：由控制器从上报公钥反查得到，客户端无从指定（TC-05）

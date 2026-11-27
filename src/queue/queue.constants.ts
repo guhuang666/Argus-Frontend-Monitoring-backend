@@ -52,7 +52,31 @@ export const ERROR_EVENT_DLQ = 'error-events-dlq';
 export const ERROR_EVENT_JOB = 'error-event';
 
 /**
- * 工作 job 的载荷：**只带主键**。
+ * 队列里一条事件的**完整定位坐标**：主键 + 分区键。
+ *
+ * ── 为什么 event_id 不够，必须再带上 timestamp ───────────────────────────
+ * `error_events` 按 `timestamp` 做 RANGE 分区之后：
+ *   ① 主键变成复合的 `(event_id, timestamp)`；
+ *   ② PostgreSQL 分区表**没有全局索引** —— 每个分区各有一份独立索引。
+ * 只拿 event_id 去定位，planner 做不了分区裁剪，得把保留期内**每天一个分区**
+ * 全部翻一遍（30 天 = 30 份索引各查一次，且 UPDATE 还要逐个分区加行锁）。
+ * 带上 timestamp 后，`(event_id, "timestamp")` 直接命中单个分区的复合主键索引，
+ * 代价从「N 个分区各查一次」降到「一次」。
+ *
+ * ── 为什么 timestamp 用字符串而不是 Date ─────────────────────────────────
+ * Redis 里不存 JS 的 Date（JSON 序列化后会变成字符串，甚至被写成 `{}`）。
+ * ISO 8601 字符串跨进程、跨语言、跨时间都稳定，Worker 侧直接 `::timestamptz`
+ * 转型即可，不需要在载荷里赌任何序列化实现。
+ */
+export interface ErrorEventRef {
+  /** 事件主键（error_events.event_id） */
+  eventId: string;
+  /** 事件发生时间，ISO 8601（error_events.timestamp，同时是分区键） */
+  timestamp: string;
+}
+
+/**
+ * 工作 job 的载荷：**只带主键 + 分区键**。
  *
  * 明细（type / message / stack）从 PG 现读，不在 Redis 里存第二份 —— 否则事件在
  * 入库后被修正、或者 schema 演进时，队列里那份就成了过期真相。载荷小还有个副作用
@@ -64,18 +88,23 @@ export const ERROR_EVENT_JOB = 'error-event';
  *   · 逐条消费：每事件 4~5 条 SQL（其中 2 条写同一行 error_groups）
  *   · 批量 50：50 条事件只需 ~6 条 SQL（times_seen 一次 +=50）
  *
- * 只带主键的约定不变 —— 数组里放的仍然是 event_id，不是明细。
+ * ── 载荷演进（破坏性）──────────────────────────────────────────────────
+ * 分区改造前这里是 `eventIds: string[]`，只带主键。现在换成 `events`：
+ * 旧形状的 job 在新代码里读出来是空数组，会被当成"空载荷"直接跳过。
+ * 所以切换时要么等队列消费干净，要么接受这批 job 白跑（事件仍会被补扫按
+ * `processed_at IS NULL` 捞回来，不丢）。docker-compose 里的 redis 没挂卷，
+ * 重启即清空，本地开发不用特意处理。
  */
 export interface ErrorEventJobData {
   /**
-   * 本 job 要处理的事件主键。
+   * 本 job 要处理的事件坐标。
    *
    * 单条上报也走这里（长度 1）—— 消费端只有一条代码路径，
    * 不必为"1 条"和"多条"各维护一套归并逻辑。
    *
    * 可空：job 载荷来自 Redis，可能是老数据或被写坏的值，读的时候用 `?? []` 兜底。
    */
-  eventIds?: string[];
+  events?: ErrorEventRef[];
   /**
    * 产生这条 job 的 HTTP 请求 id（M6-6）。
    *
@@ -87,7 +116,13 @@ export interface ErrorEventJobData {
   requestId?: string;
 }
 
-/** 死信载荷：原载荷 + 失败现场，够事后定位就行 */
+/**
+ * 死信载荷：原载荷 + 失败现场，够事后定位就行。
+ *
+ * `events` 原样带过来 —— 重驱动任务把这批事件重新入队时，靠的就是里面的
+ * `(eventId, timestamp)` 坐标。只留一个代表 id 的话，其余事件永远查不到
+ * 是被哪次失败带走的（见 processor 的 onFailed）。
+ */
 export interface ErrorEventDlqData extends ErrorEventJobData {
   /** 代表 id：失败现场只留一个可读主键，便于日志里 grep */
   eventId: string;

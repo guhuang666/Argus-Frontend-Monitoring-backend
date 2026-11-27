@@ -169,9 +169,17 @@ describe('ErrorEventsService.ingest 的入队', () => {
     expect(queue.added).toHaveLength(1);
     expect(queue.added[0].name).toBe(ERROR_EVENT_JOB);
     // M7-T5 起载荷是数组形状：单条上报也走批量路径（长度 1），
-    // 消费端因此只有一条代码路径
+    // 消费端因此只有一条代码路径。
+    // 分区改造后数组里每条必须带 (eventId, timestamp) 完整坐标 ——
+    // 只带主键的话 Worker 无法定位到具体分区（见 queue.constants 的 ErrorEventRef）。
+    // SDK 没带 timestamp 时由服务端补 now()，值不确定，只要求是合法 ISO 串。
     expect(queue.added[0].data).toEqual({
-      eventIds: ['550e8400-e29b-41d4-a716-446655440000'],
+      events: [
+        {
+          eventId: '550e8400-e29b-41d4-a716-446655440000',
+          timestamp: expect.any(String),
+        },
+      ],
     });
     expect(queue.added[0].opts.jobId).toBe('550e8400-e29b-41d4-a716-446655440000');
     expect(queue.added[0].opts.attempts).toBe(3);

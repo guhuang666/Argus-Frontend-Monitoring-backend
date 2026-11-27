@@ -13,6 +13,7 @@ import {
   toJobId,
   type ErrorEventDlqData,
   type ErrorEventJobData,
+  type ErrorEventRef,
 } from '../queue/queue.constants';
 import {
   buildCulprit,
@@ -145,27 +146,27 @@ export class ErrorEventProcessor {
    * 不要自己吞掉错误假装成功 —— 吞掉等于永久丢失这条事件的归并。
    */
   async handle(job: Job<ErrorEventJobData>): Promise<void> {
-    const eventIds = job.data.eventIds ?? [];
+    const events = job.data.events ?? [];
     const requestId = job.data.requestId;
 
-    if (eventIds.length === 0) {
-      this.logger.warn(`job 载荷里没有事件主键，跳过: jobId=${job.id ?? '-'}`);
+    if (events.length === 0) {
+      this.logger.warn(`job 载荷里没有事件坐标，跳过: jobId=${job.id ?? '-'}`);
       return;
     }
 
     // ── 批量路径（M7-T5）──────────────────────────────────────────────
-    const summary = await this.claimMany(eventIds);
+    const summary = await this.claimMany(events);
 
     if (summary.claimed === 0) {
       // 整批都没抢到：多半是重复投递（退场时 visibilitychange + pagehide 会发两次）
-      await this.explainUnclaimed(eventIds[0], requestId);
+      await this.explainUnclaimed(events[0], requestId);
       return;
     }
 
     // 一条汇总日志而不是 N 条：批量之后逐条打会把日志量放大 50 倍，
     // 而排查时真正需要的是「这一批进了几个问题、跳过几条」。
     this.logger.log(
-      `已消费 ${summary.claimed}/${eventIds.length} 条 requestId=${requestId ?? '-'} ` +
+      `已消费 ${summary.claimed}/${events.length} 条 requestId=${requestId ?? '-'} ` +
         `groups=${summary.groups} skipped=${summary.skipped} ` +
         `symbolicated=${summary.symbolicated}/${summary.claimed} ` +
         `times=${summary.timesSeenByGroup.join('/')}`,
@@ -193,14 +194,23 @@ export class ErrorEventProcessor {
    * `toHourBucket()` 返回的是 Date 对象，`Date` 作为 Map 的 key 用的是**对象标识**
    * 而不是值 —— 两个内容相同的 Date 是两个不同的 key。必须用 getTime() 归一。
    */
-  private async claimMany(eventIds: string[]): Promise<BatchOutcome> {
+  private async claimMany(events: ErrorEventRef[]): Promise<BatchOutcome> {
     return this.prisma.$transaction(
       async (tx) => {
         // ① 一条 UPDATE 声明整批：抢到的才归我处理，抢不到的（已处理过）自动略过
+        //
+        // 条件用 `(event_id, "timestamp")` 行值比较，而不是只有 event_id：
+        // error_events 按 timestamp 分区后每天一个分区，而 PostgreSQL 分区表
+        // **没有全局索引** —— 只带 event_id 时 planner 做不了分区裁剪，得把保留期内
+        // 所有分区翻一遍（每个分区一次索引查找，UPDATE 还要逐个分区加行锁）。
+        // 带上分区键后直接命中单个分区的复合主键索引，代价从 O(分区数) 降到 O(1)。
+        const refs = events.map(
+          (e) => Prisma.sql`(${e.eventId}::text, ${e.timestamp}::timestamptz)`,
+        );
         const claimed = await tx.$queryRaw<ClaimedEvent[]>`
           UPDATE error_events
              SET processed_at = now()
-           WHERE event_id IN (${Prisma.join(eventIds)})
+           WHERE (event_id, "timestamp") IN (${Prisma.join(refs)})
              AND processed_at IS NULL
           RETURNING event_id, mechanism, "type", message, stack, timestamp, release, project_id, user_id, environment
         `;
@@ -208,7 +218,7 @@ export class ErrorEventProcessor {
         if (claimed.length === 0) {
           return {
             claimed: 0,
-            skipped: eventIds.length,
+            skipped: events.length,
             groups: 0,
             symbolicated: 0,
             timesSeenByGroup: [],
@@ -399,6 +409,7 @@ export class ErrorEventProcessor {
         //   ② 再统一转成 SQL 的 VALUES 行
         const rows: Array<{
           eventId: string;
+          timestamp: Date;
           groupId: string | undefined;
           frames: string | null;
         }> = [];
@@ -407,6 +418,7 @@ export class ErrorEventProcessor {
           for (const item of bucket.items) {
             rows.push({
               eventId: item.event.event_id,
+              timestamp: item.event.timestamp,
               groupId: bucket.groupId,
               frames:
                 item.framesToStore.length > 0
@@ -416,13 +428,15 @@ export class ErrorEventProcessor {
           }
         }
 
-        // 一行 = 一个三元组 (event_id, group_id, frames)。
-        // ::text / ::uuid / ::jsonb 是给参数标类型 —— 参数化之后 Postgres
-        // 推断不出类型，不标会报 "could not determine data type"。
+        // 一行 = 一个四元组 (event_id, ts, group_id, frames)。
+        // ::text / ::timestamptz / ::uuid / ::jsonb 是给参数标类型 —— 参数化之后
+        // Postgres 推断不出类型，不标会报 "could not determine data type"。
         // Prisma.sql 保证值走占位符（$1、$2…），不是拼字符串。
+        //
+        // 定位同样带上 ts（分区键）：只按 event_id 更新会扫遍保留期内所有分区。
         const values = rows.map(
           (row) =>
-            Prisma.sql`(${row.eventId}::text, ${row.groupId}::uuid, ${row.frames}::jsonb)`,
+            Prisma.sql`(${row.eventId}::text, ${row.timestamp}::timestamptz, ${row.groupId}::uuid, ${row.frames}::jsonb)`,
         );
 
         await tx.$executeRaw`
@@ -430,13 +444,14 @@ export class ErrorEventProcessor {
              SET group_id = v.group_id,
                  -- 没有 frames 时不覆盖原有值（与逐条路径"字段整个不出现"等价）
                  stacktrace_frames = COALESCE(v.frames, e.stacktrace_frames)
-            FROM (VALUES ${Prisma.join(values)}) AS v(event_id, group_id, frames)
+            FROM (VALUES ${Prisma.join(values)}) AS v(event_id, ts, group_id, frames)
            WHERE e.event_id = v.event_id
+             AND e."timestamp" = v.ts
         `;
 
         return {
           claimed: claimed.length,
-          skipped: eventIds.length - claimed.length,
+          skipped: events.length - claimed.length,
           groups: buckets.size,
           symbolicated,
           timesSeenByGroup,
@@ -448,11 +463,20 @@ export class ErrorEventProcessor {
     );
   }
 
-  /** 没抢到声明时，查清楚是哪一种情况再记日志（重复投递是正常现象，不该刷 error） */
+  /**
+   * 没抢到声明时，查清楚是哪一种情况再记日志（重复投递是正常现象，不该刷 error）。
+   *
+   * ⚠️ 这里仍然只按 `eventId` 单列查。等 `error_events` 真的改成复合主键
+   * `(event_id, timestamp)` 后，Prisma 的 `where` 必须换成
+   * `{ eventId_timestamp: { eventId, timestamp } }`，否则**编译期**就过不去。
+   * 现在 schema 还是单列 `@id`，所以先保持单列；这段只在"整批都没抢到"的
+   * 诊断路径上跑，不在热路径。
+   */
   private async explainUnclaimed(
-    eventId: string,
+    ref: ErrorEventRef,
     requestId?: string,
   ): Promise<void> {
+    const eventId = ref.eventId;
     const row = await this.prisma.errorEvent.findUnique({
       where: { eventId },
       select: { processedAt: true },
@@ -488,11 +512,12 @@ export class ErrorEventProcessor {
     }
 
     const attempts = job.opts.attempts ?? 1;
-    // M7-T5 起一个 job 可能带多条主键。DLQ 里必须把**整批**都留下来，
-    // 否则失败现场只剩下一个代表 id，其余事件永远查不到是被哪次失败带走的。
-    const eventIds = job.data.eventIds ?? [];
+    // M7-T5 起一个 job 可能带多条事件。DLQ 里必须把**整批坐标**都留下来，
+    // 否则失败现场只剩下一个代表 id，重驱动任务就找不回其余事件的
+    // (event_id, timestamp) —— 少了分区键，连定位都做不到。
+    const events = job.data.events ?? [];
     /** 只用于日志/前缀的那一个代表 id */
-    const eventId = eventIds[0] ?? '(unknown)';
+    const eventId = events[0]?.eventId ?? '(unknown)';
     // requestId 跟着 job 一起进来，这里必须**接着往下传**（进 DLQ 载荷 + 日志）：
     // 一条事件最终进了死信，几乎是最需要回溯"它当初是从哪次请求来的"的场景
     const requestId = job.data.requestId;
@@ -508,7 +533,7 @@ export class ErrorEventProcessor {
 
     // 重试耗尽 → 转 DLQ
     const payload: ErrorEventDlqData = {
-      eventIds,
+      events,
       eventId,
       requestId,
       failedReason: err.message,
